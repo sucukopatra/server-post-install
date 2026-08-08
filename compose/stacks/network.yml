@@ -34,15 +34,18 @@ services:
     - PROXIED=true
     - IP4_PROVIDER=none
     - IP6_PROVIDER=cloudflare.trace 
-# cloudflared:
-#   image: cloudflare/cloudflared:latest
-#   container_name: cloudflared
-#   restart: unless-stopped
-#   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
-#   environment:
-#     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
-#   networks:
-#     - core
+  # Parked, not dead: uncomment to enable. Indented to sit under
+  # services:, so that is all it takes -- at column 0 it uncommented into
+  # a top-level key and compose rejected the file.
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: cloudflared
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+  #   environment:
+  #   - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+  #   networks:
+  #   - core
   technitium:
     image: technitium/dns-server:latest
     container_name: technitium

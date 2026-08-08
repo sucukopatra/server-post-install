@@ -270,14 +270,17 @@ dump_sqlite() {
     return 0
   fi
 
-  local db rel out n=0
+  local db rel out magic n=0
   while IFS= read -r db; do
     # Dot-commands take a single-quoted path, which a quote in the name
     # would break out of.
     [[ $db == *"'"* ]] && { fail "skipping path with a quote: $db"; continue; }
 
-    # *.db is also used by things that are not SQLite.
-    [[ $(head -c 15 "$db" 2>/dev/null) == "SQLite format 3" ]] || continue
+    # *.db is also used by things that are not SQLite. Read with the
+    # builtin rather than `head -c`: this walks every file under $CONFIG,
+    # and on this host that is a fork per candidate to look at 15 bytes.
+    magic=""; read -r -N 15 magic < "$db" 2>/dev/null || true
+    [[ $magic == "SQLite format 3" ]] || continue
 
     rel=${db#"$CONFIG"/}
     out="$DUMP_DIR/sqlite/$rel"
@@ -322,11 +325,41 @@ check_immich_dump() {
   fi
 }
 
+# The engine databases on this host: which container holds each one, what
+# engine it runs, and where its live data directory is.
+#
+# One table rather than two, because the dump loop below and the exclusion
+# loop further down are the same three rows read for different reasons --
+# and a container dumped but missing from the exclusions puts the live
+# directory into the snapshot next to its own dump, invisibly until a
+# restore puts the torn copy back.
+#
+# Keys are container names, because that is what dump_to writes as
+# $DUMP_DIR/<container>.sql. Services absent from this host are skipped by
+# both loops, so synapse is listed even though it is not deployed:
+# enabling stacks/matrix.yml must not quietly reintroduce the hole.
+declare -A SQL_ENGINE=(
+  [immich_postgres]=postgres      # immich's own dump is the restore path
+  [synapse-db]=postgres
+  [romm-db]=mariadb
+)
+declare -A SQL_LIVE_DIR=(
+  [immich_postgres]="$CONFIG/immich/database"
+  [synapse-db]="$CONFIG/synapse/db"
+  [romm-db]="$CONFIG/romm/mysql"
+)
+
 log "dumping databases"
 if have_docker; then
-  dump_postgres immich_postgres   # excluded below; immich's own dump is the restore path
-  dump_postgres synapse-db
-  dump_mariadb  romm-db
+  # Sorted, so the log reads the same way every night; an associative
+  # array's own iteration order is unspecified.
+  for c in $(printf '%s\n' "${!SQL_ENGINE[@]}" | sort); do
+    case ${SQL_ENGINE[$c]} in
+      postgres) dump_postgres "$c" ;;
+      mariadb)  dump_mariadb  "$c" ;;
+      *)        fail "no dump method for engine '${SQL_ENGINE[$c]}' ($c)" ;;
+    esac
+  done
   check_immich_dump
 else
   fail "docker not found -- database dumps skipped"
@@ -387,16 +420,7 @@ EOF
 # heredoc above are the one arrangement able to produce a snapshot holding
 # neither the dump nor the data it stands for, invisibly until a restore.
 #
-# Keys are container names, because that is what dump_to writes as
-# $DUMP_DIR/<container>.sql. Services absent from this host are skipped,
-# so synapse is listed even though it is not deployed: enabling
-# stacks/matrix.yml must not quietly reintroduce the hole.
-declare -A SQL_LIVE_DIR=(
-  [immich_postgres]="$CONFIG/immich/database"
-  [synapse-db]="$CONFIG/synapse/db"
-  [romm-db]="$CONFIG/romm/mysql"
-)
-
+# The paths come from SQL_LIVE_DIR, declared beside the dump loop above.
 for c in "${!SQL_LIVE_DIR[@]}"; do
   live=${SQL_LIVE_DIR[$c]}
   # Not deployed here: nothing to exclude and nothing to warn about.

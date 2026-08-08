@@ -43,6 +43,15 @@
 
 set -euo pipefail
 
+# Before 4.4, "${arr[@]}" on an empty array is an "unbound variable" error
+# under `set -u`, and several arrays here are legitimately empty -- a
+# snapshot with no SQL dumps, no services pending a database load. Stated
+# and checked rather than worked around at each use site.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "bash 4.4 or newer is required (this is $BASH_VERSION)" >&2
+  exit 1
+fi
+
 ENV_FILE=/etc/bmo-backup.env
 
 # ---------------------------------------------------------------- output
@@ -421,7 +430,7 @@ SNAP_SQL_DUMPS=()
 # regex metacharacter cannot turn into a wildcard.
 svc_sql_dumps() {
   local svc=$1 d
-  for d in ${SNAP_SQL_DUMPS[@]+"${SNAP_SQL_DUMPS[@]}"}; do
+  for d in "${SNAP_SQL_DUMPS[@]}"; do
     [[ $d == "$svc".sql || $d == "$svc"[-_]*.sql ]] && printf '%s\n' "$d"
   done
   return 0
@@ -448,10 +457,19 @@ svc_sql_dumps() {
 # "it exists" if one is ever removed.
 wait_ready() {
   local c=$1 probe=${2:-} timeout=${3:-300}
-  local waited=0 interval=2 state health
+  local waited=0 interval=2 state health inspected
 
   while (( waited < timeout )); do
-    state=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null) || state=missing
+    # Status and health in one inspect, not two. This polls every 2s for
+    # up to five minutes, and asking the daemon twice per tick for two
+    # fields of the same object is 150 round trips nobody needs. The
+    # separator cannot appear in either value.
+    state=missing health=""
+    if inspected=$(docker inspect \
+         -f '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+         "$c" 2>/dev/null); then
+      state=${inspected%%|*}; health=${inspected#*|}
+    fi
     case $state in
       running) ;;
       missing) warn "$c does not exist"; return 1 ;;
@@ -461,7 +479,6 @@ wait_ready() {
       *) sleep "$interval"; waited=$(( waited + interval )); continue ;;
     esac
 
-    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)
     if [[ -n $health ]]; then
       if [[ $health == healthy ]]; then
         ok "$c healthy after ${waited}s"
@@ -506,6 +523,56 @@ snapshot_id() {
     | grep -oE '"short_id":"[^"]+"' | tail -1 | cut -d'"' -f4 || true
 }
 
+# One level under $CONFIG in snapshot $1: the services that keep
+# configuration on disk, which is the same unit this script restores.
+# _dumps is not a service; it is where the databases of all the others
+# are.
+#
+# The sed anchor on ^$CONFIG/ is doing real work, and every `restic ls`
+# parse in this file has one for the same reason: `restic ls` prints a
+# header line -- "snapshot abc1234 of [...] filtered by [...] at ...:" --
+# before any paths, and prints it whether or not anything matched. A test
+# as loose as `| grep -q .` therefore always succeeds, and a membership
+# check built on one would report every service as present.
+#
+# A function rather than a pipeline written out at each call site: that
+# reasoning has to hold everywhere it is used, and a copy edited without
+# it fails silently and in the direction of "everything is fine".
+snap_config_svcs() {
+  restic ls "$1" "$CONFIG" 2>/dev/null \
+    | sed -n "s|^${CONFIG}/\([^/]*\)$|\1|p" | grep -v '^_dumps$' | sort -u || true
+}
+
+# The top-level *.sql files under _dumps in snapshot $1 -- the engine
+# dumps and nothing else. An unfiltered listing put "README" (backup.sh
+# writes one there every run) and "sqlite" (the directory holding the
+# other 40) in among the database names, on the one screen someone reads
+# while actually recovering a host.
+snap_sql_dumps() {
+  restic ls "$1" "$CONFIG/_dumps" 2>/dev/null \
+    | sed -n "s|^${CONFIG}/_dumps/||p" | grep -E '\.sql$' | sort || true
+}
+
+# What counts as a SQLite database by name. The same list backup.sh's
+# dump_sqlite discovers with, so the two stay in step -- and one spelling
+# within this file rather than one per call site.
+SQLITE_EXT_RE='\.(db|sqlite|sqlite3)$'
+
+# How much the rollbacks already on this host use, and what is left on the
+# filesystem holding them, tab-separated. Reported in two places -- the
+# --list inventory and the warning shown as another one is about to be
+# added -- and the two must not be able to disagree.
+#
+# Both halves fall back to "?" rather than to an empty column: a listing
+# that reads "total   " is a broken listing, and a restore is not the
+# moment to start wondering whether the tool is working.
+rollback_usage() {
+  local sz avail
+  sz=$(du -sh "$ROLLBACK_ROOT" 2>/dev/null | cut -f1 || true)
+  avail=$(df -h --output=avail "$ROLLBACK_ROOT" 2>/dev/null | tail -1 | tr -d ' ' || true)
+  printf '%s\t%s\n' "${sz:-?}" "${avail:-?}"
+}
+
 restic cat config >/dev/null 2>&1 \
   || die "cannot open $RESTIC_REPOSITORY -- wrong passphrase, or no SSH access as root"
 
@@ -525,21 +592,10 @@ if [[ $MODE == list ]]; then
   [[ -n $snap ]] || die "no snapshot matching '$SNAPSHOT' for host '$BACKUP_HOST'"
 
   step "Services in snapshot $snap"
-  # One level under $CONFIG is one service, which is the same unit this
-  # script restores. _dumps is not a service; it is where the databases
-  # of all the others are.
-  restic ls "$snap" "$CONFIG" 2>/dev/null \
-    | sed -n "s|^${CONFIG}/\([^/]*\)$|\1|p" \
-    | grep -v '^_dumps$' | sort -u | sed 's/^/  /'
+  snap_config_svcs "$snap" | sed 's/^/  /'
 
   step "Database dumps in snapshot $snap"
-  # Only *.sql files are engine dumps. This used to list everything at
-  # the top of _dumps, which put "README" (backup.sh writes one there
-  # every run) and "sqlite" (the directory holding the other 40) in among
-  # the database names -- on the one screen someone reads while actually
-  # recovering a host.
-  sql_dumps=$(restic ls "$snap" "$CONFIG/_dumps" 2>/dev/null \
-    | sed -n "s|^${CONFIG}/_dumps/||p" | grep -E '\.sql$' | sort || true)
+  sql_dumps=$(snap_sql_dumps "$snap")
   if [[ -n $sql_dumps ]]; then
     echo "  SQL engines:"
     printf '%s\n' "$sql_dumps" | sed 's/^/    /'
@@ -556,7 +612,7 @@ if [[ $MODE == list ]]; then
   # the SQL listing above, which wants top-level *.sql and nothing else,
   # worked fine and gave no hint anything was wrong.
   n_sqlite=$(restic ls --recursive "$snap" "$CONFIG/_dumps/sqlite" 2>/dev/null \
-    | grep -cE '\.(db|sqlite|sqlite3)$' || true)
+    | grep -cE "$SQLITE_EXT_RE" || true)
   echo "  SQLite: ${n_sqlite:-0} database(s)"
 
   # Collected first, and the header printed only if there is something
@@ -581,10 +637,9 @@ if [[ $MODE == list ]]; then
       rb_sz=$(du -sh "$ROLLBACK_ROOT/$r" 2>/dev/null | cut -f1 || true)
       printf '  %-22s %s\n' "$r" "${rb_sz:-?}"
     done <<<"$rollbacks"
-    rb_sz=$(du -sh "$ROLLBACK_ROOT" 2>/dev/null | cut -f1 || true)
-    rb_avail=$(df -h --output=avail "$ROLLBACK_ROOT" 2>/dev/null | tail -1 | tr -d ' ' || true)
-    printf '  %-22s %s\n' "total" "${rb_sz:-?}"
-    printf '\n  %s free on the filesystem holding them. Delete one with:\n' "${rb_avail:-?}"
+    IFS=$'\t' read -r rb_sz rb_avail < <(rollback_usage)
+    printf '  %-22s %s\n' "total" "$rb_sz"
+    printf '\n  %s free on the filesystem holding them. Delete one with:\n' "$rb_avail"
     printf '    rm -rf %s/<timestamp>\n' "$ROLLBACK_ROOT"
   fi
   exit 0
@@ -633,25 +688,15 @@ SNAP=$(snapshot_id "$SNAPSHOT")
 # storing it faithfully. SVC_DATA is the list of exactly those paths, so
 # its keys are the missing half of the enumeration.
 
-# One level under $CONFIG in the snapshot: the services that keep
-# configuration on disk. Read once and used twice -- to expand --all, and
-# to decide per service whether it has a $CONFIG half at all.
-#
-# The sed anchor on ^$CONFIG/ is doing real work, and every other `restic
-# ls` parse in this file has one for the same reason: `restic ls` prints a
-# header line -- "snapshot abc1234 of [...] filtered by [...] at ...:" --
-# before any paths, and prints it whether or not anything matched. A test
-# as loose as `| grep -q .` therefore always succeeds, and a membership
-# check built on one would report every service as present.
-mapfile -t SNAP_CONFIG_SVCS < <(
-  restic ls "$SNAP" "$CONFIG" 2>/dev/null \
-    | sed -n "s|^${CONFIG}/\([^/]*\)$|\1|p" | grep -v '^_dumps$' | sort -u || true)
+# Read once and used twice -- to expand --all, and to decide per service
+# whether it has a $CONFIG half at all.
+mapfile -t SNAP_CONFIG_SVCS < <(snap_config_svcs "$SNAP")
 
 # Exact string membership, not a pattern match: a service name is a
 # directory name and has no business being interpreted as a regex.
 in_snap_config() {
   local want=$1 d
-  for d in ${SNAP_CONFIG_SVCS[@]+"${SNAP_CONFIG_SVCS[@]}"}; do
+  for d in "${SNAP_CONFIG_SVCS[@]}"; do
     [[ $d == "$want" ]] && return 0
   done
   return 1
@@ -659,7 +704,7 @@ in_snap_config() {
 
 if [[ ${SERVICES[0]:-} == --all ]]; then
   mapfile -t SERVICES < <(
-    { printf '%s\n' ${SNAP_CONFIG_SVCS[@]+"${SNAP_CONFIG_SVCS[@]}"}
+    { printf '%s\n' "${SNAP_CONFIG_SVCS[@]}"
       printf '%s\n' "${!SVC_DATA[@]}"
     } | grep -v '^$' | sort -u)
   (( ${#SERVICES[@]} )) || die "snapshot $SNAP contains nothing under $CONFIG"
@@ -683,10 +728,9 @@ printf '  %-14s %s\n' "services:"   "${SERVICES[*]}"
 # one is added, and the operator is being asked to approve it anyway.
 old_rb=$(find "$ROLLBACK_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || true)
 if (( ${old_rb:-0} )); then
-  rb_sz=$(du -sh "$ROLLBACK_ROOT" 2>/dev/null | cut -f1 || true)
-  rb_avail=$(df -h --output=avail "$ROLLBACK_ROOT" 2>/dev/null | tail -1 | tr -d ' ' || true)
-  warn "$old_rb rollback(s) already here, using ${rb_sz:-?} in $ROLLBACK_ROOT"
-  warn "${rb_avail:-?} free -- 'bmo-restore --list' itemises them"
+  IFS=$'\t' read -r rb_sz rb_avail < <(rollback_usage)
+  warn "$old_rb rollback(s) already here, using $rb_sz in $ROLLBACK_ROOT"
+  warn "$rb_avail free -- 'bmo-restore --list' itemises them"
   (( DRY_RUN )) || warn "this run adds another, and deletes none of them"
 fi
 
@@ -727,9 +771,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mapfile -t SNAP_SQL_DUMPS < <(
-  restic ls "$SNAP" "$CONFIG/_dumps" 2>/dev/null \
-    | sed -n "s|^${CONFIG}/_dumps/||p" | grep -E '\.sql$' | sort || true)
+mapfile -t SNAP_SQL_DUMPS < <(snap_sql_dumps "$SNAP")
 
 restored=(); sql_pending=()
 
@@ -739,7 +781,7 @@ for svc in "${SERVICES[@]}"; do
 
   # ---- stop only this service's containers ----
   for c in $(svc_containers "$svc"); do
-    if docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null | grep -q true; then
+    if [[ $(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null) == true ]]; then
       run docker stop "$c" >/dev/null
       done_ok "stopped $c"
     else
@@ -830,13 +872,10 @@ for svc in "${SERVICES[@]}"; do
     # /srv/docker/config/jellyfin/data back" -- naming a directory where
     # a database belongs, and hiding that there were two of them.
     # cross-seed.db sits at the top level and looked correct throughout.
-    #
-    # The extension list is the same one backup.sh discovers with, so
-    # the two stay in step.
     mapfile -t would < <(
       restic ls --recursive "$SNAP" "$CONFIG/_dumps/sqlite/$svc" 2>/dev/null \
         | sed -n "s|^${CONFIG}/_dumps/sqlite/${svc}/||p" \
-        | grep -E '\.(db|sqlite|sqlite3)$' || true)
+        | grep -E "$SQLITE_EXT_RE" || true)
     if (( ${#would[@]} )); then
       for r in "${would[@]}"; do
         printf '  %s[dry-run]%s put %s back from _dumps, dropping any -wal/-shm\n' \
@@ -1003,7 +1042,7 @@ env_value() {
   printf '%s\n' "$val"
 }
 
-for svc in ${sql_pending[@]+"${sql_pending[@]}"}; do
+for svc in "${sql_pending[@]}"; do
   step "$svc database"
 
   case ${SVC_SQL[$svc]} in
@@ -1084,15 +1123,12 @@ for svc in ${sql_pending[@]+"${sql_pending[@]}"}; do
       # application version is NOT recorded in the dump in any stable
       # form, so it is reported for a human to judge, not asserted.
 
-      # Which database psql connects to. Empty means "whatever
-      # $POSTGRES_DB is inside the container"; set for real below, once
-      # the dump's shape is known.
-      psql_db=""
-
-      # The dump's shape, recorded explicitly rather than inferred from
-      # $psql_db being non-empty. It decides the target database above AND
-      # the error handling below, and those two must not be able to drift
-      # apart because one of them was reading the other's variable.
+      # The dump's shape, and the only record of it. It decides both the
+      # database psql connects to and how the outcome is judged, and those
+      # two must not be able to drift apart -- so the target database is
+      # derived from this inside the container at the point of use rather
+      # than carried alongside it in a second variable that could
+      # disagree. Set for real below, once the header has been read.
       dump_is_cluster=0
 
       if (( DRY_RUN )); then
@@ -1226,11 +1262,9 @@ for svc in ${sql_pending[@]+"${sql_pending[@]}"}; do
         # down would be a coincidence -- a table holding that text, say --
         # and would send a single-database dump to the wrong target.
         if grep -q 'database cluster dump' <<<"$(head -5 <<<"$dump_head")"; then
-          psql_db=postgres
           dump_is_cluster=1
           ok "dump is a cluster dump (pg_dumpall) -- loading via the postgres database"
         else
-          psql_db=""
           dump_is_cluster=0
           ok "dump is a single-database dump (pg_dump) -- loading into \$POSTGRES_DB"
         fi
@@ -1293,20 +1327,20 @@ for svc in ${sql_pending[@]+"${sql_pending[@]}"}; do
         # returns 0 for a run in which hundreds of statements failed. So the
         # cluster path is judged on what psql actually complained about,
         # with the two known-harmless errors subtracted, rather than on $?.
+        # The uppercase name throughout, because that is the one the EXIT
+        # trap knows: a lowercase alias of it is a second handle on the
+        # same file that the trap cannot see being reassigned.
         PSQL_ERR=$(mktemp)
-        psql_err=$PSQL_ERR
         psql_rc=0
         # shellcheck disable=SC2016
         dump_stream "$newest" \
           | docker exec -i immich_postgres sh -c \
-              'db=$1; stop=$2
-               [ -n "$db" ] || db=$POSTGRES_DB
-               if [ "$stop" = 1 ]; then
-                 exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$db"
+              'if [ "$1" = 1 ]; then
+                 exec psql -U "$POSTGRES_USER" -d postgres
                fi
-               exec psql -U "$POSTGRES_USER" -d "$db"' \
-              sh "$psql_db" "$(( ! dump_is_cluster ))" \
-          >/dev/null 2>"$psql_err" || psql_rc=$?
+               exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+              sh "$dump_is_cluster" \
+          >/dev/null 2>"$PSQL_ERR" || psql_rc=$?
 
         if (( ! dump_is_cluster )); then
           # ON_ERROR_STOP was in force, so $? is authoritative.
@@ -1322,7 +1356,7 @@ for svc in ${sql_pending[@]+"${sql_pending[@]}"}; do
             warn "loading the Immich database stopped at the first error"
             warn "psql had already committed everything before that point, so the"
             warn "database may be partly populated -- check it before reloading."
-            [[ -s $psql_err ]] && sed 's/^/      /' "$psql_err" >&2
+            [[ -s $PSQL_ERR ]] && sed 's/^/      /' "$PSQL_ERR" >&2
             warn "The dump itself is untouched, at $newest"
           fi
         elif (( psql_rc != 0 )); then
@@ -1330,28 +1364,30 @@ for svc in ${sql_pending[@]+"${sql_pending[@]}"}; do
           # could not work around at all: no connection, a FATAL, a broken
           # stream. None of those are "some statements failed".
           warn "psql could not run the dump at all (exit $psql_rc)"
-          [[ -s $psql_err ]] && sed 's/^/      /' "$psql_err" >&2
+          [[ -s $PSQL_ERR ]] && sed 's/^/      /' "$PSQL_ERR" >&2
           warn "The dump itself is untouched, at $newest"
         else
           # The two errors every pg_dumpall --clean restore produces against
           # the role it is connected as. Anchored to the message text rather
           # than to a role name, because the role is $DB_USERNAME and this
           # script deliberately never learns what that is.
-          real_errors=$(grep -E 'ERROR:' "$psql_err" 2>/dev/null \
+          # Filtered once and held, rather than run again to print: the
+          # exclusion list is the whole point of this block, and two
+          # copies of it can report a count and then show a different set.
+          real_errors=$(grep -E 'ERROR:' "$PSQL_ERR" 2>/dev/null \
             | grep -vE 'current user cannot be dropped|role ".*" already exists' \
-            | wc -l || true)
-          if (( real_errors == 0 )); then
+            || true)
+          n_errors=$(grep -c . <<<"$real_errors" || true)
+          if (( n_errors == 0 )); then
             ok "Immich database loaded"
           else
-            warn "psql ran the whole dump but $real_errors statement(s) failed:"
-            grep -E 'ERROR:' "$psql_err" 2>/dev/null \
-              | grep -vE 'current user cannot be dropped|role ".*" already exists' \
-              | head -20 | sed 's/^/      /' >&2 || true
+            warn "psql ran the whole dump but $n_errors statement(s) failed:"
+            head -20 <<<"$real_errors" | sed 's/^/      /' >&2 || true
             warn "the database is partly populated -- check it before reloading."
             warn "The dump itself is untouched, at $newest"
           fi
         fi
-        rm -f "$psql_err"; PSQL_ERR=""
+        rm -f "$PSQL_ERR"; PSQL_ERR=""
       else
         skip "Immich database left empty"
       fi
@@ -1417,17 +1453,30 @@ if (( DRY_RUN )); then
   exit 0
 fi
 
+# $ROLLBACK is created up front, before it is known whether anything will
+# go into it, so a run that moved nothing aside leaves an empty directory
+# behind -- and --list advertises those under "Rollbacks available on this
+# host", offering an undo that would restore nothing.
+#
+# The manifest is created up front and is still empty, so it has to go
+# before the directory will; that ordering is why the two are one function
+# rather than two lines written out at each of the call sites below.
+#
+# `return 0` because a rollback that is NOT empty is the ordinary outcome,
+# and a failing rmdir at the tail of a function is exactly what `set -e`
+# would take for a fault.
+discard_empty_rollback() {
+  rm -f "$MANIFEST"
+  rmdir "$ROLLBACK" 2>/dev/null && skip "$1"
+  return 0
+}
+
 if (( ${#restored[@]} )); then
   ok "restored: ${restored[*]}"
 else
   warn "nothing was restored"
-  # A run that replaced nothing has nothing to roll back to, and leaving
-  # an empty directory behind makes --list offer an undo that would do
-  # nothing at all.
-  # The manifest is created up front and is still empty, so it has to go
-  # before the directory will.
-  rm -f "$MANIFEST"
-  rmdir "$ROLLBACK" 2>/dev/null && skip "removed the empty rollback directory"
+  # A run that replaced nothing has nothing to roll back to.
+  discard_empty_rollback "removed the empty rollback directory"
   exit 1
 fi
 
@@ -1446,16 +1495,11 @@ if [[ -s ${MANIFEST:-/dev/null} ]]; then
 EOF
 else
   # Everything restored into empty space, so nothing was moved aside and
-  # there is nothing to undo. $ROLLBACK is created up front, before it is
-  # known whether anything will go into it, so what is left here is an
-  # empty directory -- and --list advertises those under "Rollbacks
-  # available on this host", offering an undo that would restore nothing.
+  # there is nothing to undo.
   #
   # Not an edge case: this is the shape of every bare-metal restore, where
   # each service lands in a $CONFIG that run.sh has just created empty.
-  rm -f "$MANIFEST"
-  rmdir "$ROLLBACK" 2>/dev/null \
-    && skip "nothing was overwritten, so there is no rollback to keep"
+  discard_empty_rollback "nothing was overwritten, so there is no rollback to keep"
 fi
 
 cat <<EOF

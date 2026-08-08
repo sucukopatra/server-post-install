@@ -8,10 +8,22 @@
 #                         the above, then restore every service's state
 #                         from the newest snapshot (bare-metal rebuild)
 #
+#   -y, --yes             assume yes at every prompt (non-interactive)
+#
 # Every step is idempotent -- re-running is safe and is the intended
 # way to apply changes.
 
 set -euo pipefail
+
+# Before 4.4, "${arr[@]}" on an empty array is an "unbound variable" error
+# under `set -u`, and several arrays here are legitimately empty -- no
+# packages missing, no cleanup paths registered, no arguments to replay.
+# Stated and checked rather than worked around at each use site, where it
+# read as nine copies of an incantation with no explanation.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "bash 4.4 or newer is required (this is $BASH_VERSION)" >&2
+  exit 1
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE=""
@@ -38,7 +50,10 @@ prompt_yn() {
 }
 
 usage() {
-  sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+  # Bounded by the blank line that ends the header comment, not by a line
+  # count: a count goes stale the moment the header grows a line, and the
+  # first thing to fall off the bottom is the flag documented last.
+  sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
   exit "${1:-0}"
 }
 
@@ -77,9 +92,9 @@ if [[ ${BMO_LOG:-0} != 1 ]]; then
   fi
   if [[ -w $LOG_FILE ]]; then
     printf '\n===== %s  %s %s =====\n' \
-      "$(date -Is)" "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[*]-}" >> "$LOG_FILE"
+      "$(date -Is)" "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[*]}" >> "$LOG_FILE"
     set +e
-    bash "${BASH_SOURCE[0]}" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"} 2>&1 | tee -a "$LOG_FILE"
+    bash "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
     exit "${PIPESTATUS[0]}"
   fi
 fi
@@ -134,7 +149,7 @@ cleanup() {
     fi
     CLEANUP_MOUNT=""
   fi
-  for p in ${CLEANUP_PATHS[@]+"${CLEANUP_PATHS[@]}"}; do
+  for p in "${CLEANUP_PATHS[@]}"; do
     [[ -n $p ]] || continue
     rm -rf "$p" 2>/dev/null || true
   done
@@ -256,14 +271,29 @@ install_templated() {
   rm -f "$tmp"
 }
 
+# Which of these package names are not installed, one name per line.
+#
+# `dpkg-query -W` takes the whole list at once, so this is one process and
+# one pass over dpkg's status database rather than a dpkg-query and a grep
+# per name -- the two callers below ask about ~35 packages between them.
+# Names dpkg has never heard of are absent from the output entirely, which
+# is the same answer as "not installed".
+missing_pkgs() {
+  local p st
+  local -A installed=()
+  while read -r p st; do
+    [[ $st == *"ok installed"* ]] && installed[$p]=1
+  done < <(dpkg-query -W -f='${Package} ${Status}\n' "$@" 2>/dev/null || true)
+  for p in "$@"; do
+    [[ -n ${installed[$p]:-} ]] || printf '%s\n' "$p"
+  done
+}
+
 step "APT repositories"
 
 # Both repository blocks fetch a signing key with curl, which a minimal
 # Debian install lacks and packages.txt only installs in the next step.
-boot_missing=()
-for p in curl ca-certificates gnupg; do
-  dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || boot_missing+=("$p")
-done
+mapfile -t boot_missing < <(missing_pkgs curl ca-certificates gnupg)
 if (( ${#boot_missing[@]} )); then
   sudo apt-get update -qq
   sudo apt-get install -y "${boot_missing[@]}"
@@ -304,15 +334,19 @@ step "Packages"
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$REPO_DIR/config/packages.txt")
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
 
-sudo apt-get update -qq
-missing=()
-for p in "${PKGS[@]}" "${DOCKER_PKGS[@]}"; do
-  dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q "ok installed" || missing+=("$p")
-done
+# What is missing is answered from the local dpkg database, so the index
+# refresh below is only worth its network round trips when there is
+# actually something to install -- on the steady-state re-run this script
+# advertises as the normal way to apply changes, there never is.
+mapfile -t missing < <(missing_pkgs "${PKGS[@]}" "${DOCKER_PKGS[@]}")
 
 if (( ${#missing[@]} )); then
   echo "  ${#missing[@]} to install: ${missing[*]}"
   prompt_yn "proceed?" || die "aborted"
+  # After the prompt but before the install, because the Docker and
+  # Tailscale repositories may have been added moments ago and apt cannot
+  # see their packages until it has read them.
+  sudo apt-get update -qq
   sudo apt-get install -y "${missing[@]}"
   ok "${#missing[@]} packages installed"
 else
@@ -351,6 +385,15 @@ step "Directories"
 # shellcheck disable=SC2016
 create_dirs() {
   local want=$1 line dir owner cur group created=0 wrong=0
+  # Classified in one pass and acted on in bulk below. Every `sudo` is a
+  # full policy, PAM and audit evaluation, and the per-directory form cost
+  # one for the mkdir, one for the chown and one for the stat -- roughly
+  # 230 of them across the three calls this script makes, to touch 63
+  # paths. dirs.txt lists no directory before its own parent and no path
+  # twice, so deciding what exists up front sees the same disk the
+  # incremental version did.
+  local -a to_create=() check_dirs=() group_dirs=()
+  local -A want_owner=() chown_of=()
   while IFS= read -r line; do
     [[ -z $line || $line == \#* ]] && continue
     # No dirs.txt path starts with an uppercase word and a colon (they all
@@ -392,17 +435,46 @@ create_dirs() {
     # live database directories to $PUID:$PGID under a running engine -- so
     # drift is reported rather than corrected.
     if [[ ! -d $dir ]]; then
-      sudo mkdir -p "$dir"
-      [[ $owner == - ]] || sudo chown "$owner" "$dir"
+      to_create+=("$dir")
+      if [[ $owner != - ]]; then
+        # One accumulator per distinct owner; there are two or three of
+        # them across the whole file, so this is two or three chowns.
+        if [[ -n ${chown_of[$owner]:-} ]]; then
+          chown_of[$owner]+=$'\n'$dir
+        else
+          chown_of[$owner]=$dir
+        fi
+      fi
       (( ++created ))
     elif [[ $owner != - ]]; then
-      cur=$(sudo stat -c '%u:%g' "$dir" 2>/dev/null) || cur=""
-      if [[ -n $cur && $cur != "$owner" ]]; then
-        warn "$dir is $cur, expected $owner -- sudo chown $owner $dir"
-        (( ++wrong ))
-      fi
+      check_dirs+=("$dir")
+      want_owner[$dir]=$owner
     fi
   done < "$REPO_DIR/config/dirs.txt"
+
+  if (( ${#to_create[@]} )); then
+    sudo mkdir -p "${to_create[@]}"
+    for owner in "${!chown_of[@]}"; do
+      mapfile -t group_dirs <<<"${chown_of[$owner]}"
+      sudo chown "$owner" "${group_dirs[@]}"
+    done
+  fi
+
+  # One stat for every directory that already exists. Split on the LAST
+  # space: '%u:%g' can never contain one, but a directory name can, and
+  # `stat` emits its results in argument order so the warnings still come
+  # out in dirs.txt order.
+  if (( ${#check_dirs[@]} )); then
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      cur=${line##* }; dir=${line% *}
+      owner=${want_owner[$dir]:-}
+      [[ -n $owner && $cur != "$owner" ]] || continue
+      warn "$dir is $cur, expected $owner -- sudo chown $owner $dir"
+      (( ++wrong ))
+    done < <(sudo stat -c '%n %u:%g' "${check_dirs[@]}" 2>/dev/null || true)
+  fi
+
   ok "$created $want directories created"
   if (( wrong )); then
     warn "$wrong existing directories have unexpected ownership (left alone)"
@@ -841,7 +913,9 @@ if [[ -f $CADDYFILE ]]; then
   (( CADDY_DOMAIN_OK )) \
     && skip "Caddyfile exists and matches DOMAIN=$DOMAIN -- leaving it alone"
 else
-  sed "s/{{DOMAIN}}/${DOMAIN}/g" "$REPO_DIR/templates/Caddyfile.tmpl" \
+  # sed_rhs for the same reason env_set uses it: an unescaped & in the
+  # replacement expands to the whole match.
+  sed "s|{{DOMAIN}}|$(sed_rhs "$DOMAIN")|g" "$REPO_DIR/templates/Caddyfile.tmpl" \
     | sudo tee "$CADDYFILE" >/dev/null
   sudo chown "$PUID:$PGID" "$CADDYFILE"
   ok "rendered Caddyfile for $DOMAIN"
@@ -875,7 +949,10 @@ if sudo test -f "$ENV_TARGET"; then
       | sed -n 's|^[[:space:]]*-[[:space:]]*stacks/\([A-Za-z0-9._-]*\.yml\).*|\1|p'
   )
 
-  env_required=(); env_paths=()
+  # env_paths and env_present are sets rather than lists: the check below
+  # is pure membership, and asking it with `printf | grep -qxF` once per
+  # variable re-serialised and re-scanned the whole list ~40 times a run.
+  env_required=(); declare -A env_paths=()
   for f in "${included[@]}"; do
     src="$REPO_DIR/compose/stacks/$f"
     if [[ ! -f $src ]]; then
@@ -892,7 +969,9 @@ if sudo test -f "$ENV_TARGET"; then
     # A variable that opens a bind-mount source. Empty, it does not
     # misconfigure a container -- it relocates the mount to /.
     # shellcheck disable=SC2016
-    mapfile -t -O "${#env_paths[@]}" env_paths < <(
+    while IFS= read -r v; do
+      [[ -n $v ]] && env_paths[$v]=1
+    done < <(
       grep -vE '^[[:space:]]*#' "$src" \
         | grep -oE '^[[:space:]]*-[[:space:]]*"?\$\{[A-Z_][A-Z0-9_]*\}[^":]*:' \
         | grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' | tr -d '${}')
@@ -900,20 +979,22 @@ if sudo test -f "$ENV_TARGET"; then
 
   # `=.+` so a key present but blank counts as missing, which is exactly
   # what the TEMPLATE .env is full of.
-  mapfile -t env_present < <(
-    sudo grep -oE '^[A-Z_][A-Z0-9_]*=.+' "$ENV_TARGET" | cut -d= -f1 | sort -u)
+  declare -A env_present=()
+  while IFS= read -r v; do
+    [[ -n $v ]] && env_present[$v]=1
+  done < <(sudo grep -oE '^[A-Z_][A-Z0-9_]*=.+' "$ENV_TARGET" | cut -d= -f1)
 
   env_missing=(); env_missing_paths=(); env_checked=0
   while IFS= read -r v; do
     [[ -n $v ]] || continue
     (( ++env_checked ))
-    printf '%s\n' ${env_present[@]+"${env_present[@]}"} | grep -qxF "$v" && continue
-    if printf '%s\n' ${env_paths[@]+"${env_paths[@]}"} | grep -qxF "$v"; then
+    [[ -n ${env_present[$v]:-} ]] && continue
+    if [[ -n ${env_paths[$v]:-} ]]; then
       env_missing_paths+=("$v")
     else
       env_missing+=("$v")
     fi
-  done < <(printf '%s\n' ${env_required[@]+"${env_required[@]}"} | sort -u)
+  done < <(printf '%s\n' "${env_required[@]}" | sort -u)
 
   if (( ${#env_missing_paths[@]} )); then
     warn "these open a bind-mount source and are empty or absent in $ENV_TARGET:"
@@ -947,7 +1028,7 @@ fi
 if [[ $PROFILE == minimal ]]; then
   cat <<EOF
 
-$(printf '%s' "$c_grn")Minimal provisioning complete.$(printf '%s' "$c_off")
+${c_grn}Minimal provisioning complete.${c_off}
 
 Next:
   1. Fill in $ENV_TARGET
@@ -1179,8 +1260,13 @@ fi
 # nightly timer went on failing against a repository it could not open. A
 # passphrase that does not open the repository never overwrites one that
 # might.
-restic_opens() {   # $1 = password file
-  sudo restic -r "$RESTIC_REPO" --password-file "$1" snapshots --latest 1 >/dev/null 2>&1
+# $1 = password file. Prints the snapshot list as JSON; a non-zero exit is
+# "the repository could not be opened", and an empty repository is a clean
+# exit with an empty list. Listing rather than probing, because the caller
+# wants the count too and opening the repository twice to answer one
+# question is two ssh sessions and two key derivations.
+restic_snapshots() {
+  sudo restic -r "$RESTIC_REPO" --password-file "$1" snapshots --json 2>/dev/null
 }
 
 repo_ok=0
@@ -1206,7 +1292,7 @@ while (( ++attempt <= 3 )); do
     promote=1
   fi
 
-  if restic_opens "$pass_candidate"; then
+  if snaps_json=$(restic_snapshots "$pass_candidate"); then
     if (( promote )); then
       sudo install -m 600 -o root -g root "$pass_candidate" "$RESTIC_PASS_FILE"
       rm -f "$pass_candidate"
@@ -1215,9 +1301,9 @@ while (( ++attempt <= 3 )); do
       skip "restic passphrase present and opens the repository"
     fi
     # One "short_id" per snapshot; "time" would also match fields restic
-    # may add later.
-    snap_count=$(sudo restic -r "$RESTIC_REPO" --password-file "$RESTIC_PASS_FILE" \
-      snapshots --json 2>/dev/null | grep -c '"short_id"' || true)
+    # may add later. Counted from the listing the open above already
+    # fetched.
+    snap_count=$(grep -c '"short_id"' <<<"$snaps_json" || true)
     ok "connected to $RESTIC_REPO ($snap_count snapshots)"
     repo_ok=1
     break
@@ -1462,12 +1548,15 @@ printf '  %-22s %s\n' "restic repo:"   "$( (( repo_ok )) && echo "readable" || e
 
 cat <<EOF
 
-$(printf '%s' "$c_grn")Provisioning complete.$(printf '%s' "$c_off")
+${c_grn}Provisioning complete.${c_off}
 
 Not done by this script, on purpose:
   - restic init  (a new repo must be created by hand -- see above)
   - tailscale up  (needs interactive auth)
-$(if (( RESTORE_PLAUSIBLE )) && (( ! RESTORE_REQUESTED )); then cat <<'HINT'
+EOF
+
+if (( RESTORE_PLAUSIBLE )) && (( ! RESTORE_REQUESTED )); then
+  cat <<'HINT'
 
 This host has no service state and the repository has snapshots. If this
 is a rebuild, restore BEFORE starting the stack -- once a service starts
@@ -1477,7 +1566,9 @@ nightly backup snapshots that over the top:
      sudo /usr/local/sbin/bmo-restore --list
      sudo /usr/local/sbin/bmo-restore --all
 HINT
-fi)
+fi
+
+cat <<EOF
 
 Then:
      $START_HINT
