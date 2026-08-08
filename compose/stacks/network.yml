@@ -1,0 +1,54 @@
+services:
+  caddy:
+    image: caddy-cloudflare:latest
+    build: /srv/docker/build/caddy
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+    - 80:80
+    - 443:443
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    volumes:
+    - ${CONFIG}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+    - ${CONFIG}/caddy/data:/data
+    - ${CONFIG}/caddy/config:/config
+    environment:
+    - CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+    networks:
+    - core
+  cloudflare-ddns:
+    image: favonia/cloudflare-ddns:latest
+    container_name: cloudflare-ddns
+    network_mode: host
+    restart: unless-stopped
+    user: ${PUID}:${PGID}
+    read_only: true
+    cap_drop:
+    - all
+    security_opt:
+    - no-new-privileges:true
+    environment:
+    - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+    - DOMAINS=${DOMAIN}, photos.${DOMAIN}, pass.${DOMAIN}, watch.${DOMAIN}, games.${DOMAIN}, status.${DOMAIN}, discover.${DOMAIN}, listen.${DOMAIN}, findmusic.${DOMAIN}, invite.${DOMAIN}, dav.${DOMAIN}, view.${DOMAIN}, sync.${DOMAIN}
+    - PROXIED=true
+    - IP4_PROVIDER=none
+    - IP6_PROVIDER=cloudflare.trace 
+# cloudflared:
+#   image: cloudflare/cloudflared:latest
+#   container_name: cloudflared
+#   restart: unless-stopped
+#   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+#   environment:
+#     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+#   networks:
+#     - core
+  technitium:
+    image: technitium/dns-server:latest
+    container_name: technitium
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+    - ${CONFIG}/technitium:/etc/dns
+    environment:
+    - DNS_SERVER_DOMAIN=dns.${DOMAIN}

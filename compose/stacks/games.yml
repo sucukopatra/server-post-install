@@ -1,0 +1,63 @@
+services:
+  romm:
+    image: rommapp/romm:latest
+    container_name: romm
+    environment:
+      - TZ=${TZ}
+      - DB_HOST=romm-db
+      - DB_NAME=romm
+      - DB_USER=romm-user
+      - DB_PASSWD=${ROMM_DB_PASSWORD}
+      - ROMM_AUTH_SECRET_KEY=${ROMM_AUTH_SECRET_KEY}
+      # metadata providers, all optional
+      - SCREENSCRAPER_USER=${SCREENSCRAPER_USER}
+      - SCREENSCRAPER_PASSWORD=${SCREENSCRAPER_PASSWORD}
+      - RETROACHIEVEMENTS_API_KEY=${RETROACHIEVEMENTS_API_KEY}
+      - STEAMGRIDDB_API_KEY=${STEAMGRIDDB_API_KEY}
+      - IGDB_CLIENT_ID=${IGDB_CLIENT_ID}
+      - IGDB_CLIENT_SECRET=${IGDB_CLIENT_SECRET}
+      - HASHEOUS_API_ENABLED=true
+      - HLTB_API_ENABLED=true
+    volumes:
+      - ${CONFIG}/romm/config:/romm/config
+      - ${CONFIG}/romm/resources:/romm/resources    # re-fetchable cover art
+      - ${CONFIG}/romm/assets:/romm/assets          # saves & states -- back these up
+      - ${CONFIG}/romm/redis:/redis-data            # disposable task cache
+      # ROMs: /srv/nas/media/games/roms/<platform>/
+      # NAS mount guard -- see compose.yml
+      - type: bind
+        source: ${NAS}/media/games
+        target: /romm/library
+        bind:
+          create_host_path: false
+    expose:
+      - "8080"
+    depends_on:
+      romm-db:
+        condition: service_healthy
+        restart: true
+    restart: unless-stopped
+    networks:
+      - core
+
+  romm-db:
+    image: mariadb:latest
+    container_name: romm-db
+    environment:
+      - TZ=${TZ}
+      - MARIADB_ROOT_PASSWORD=${ROMM_DB_ROOT_PASSWORD}
+      - MARIADB_DATABASE=romm
+      - MARIADB_USER=romm-user
+      - MARIADB_PASSWORD=${ROMM_DB_PASSWORD}
+    volumes:
+      - ${CONFIG}/romm/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      start_period: 30s
+      start_interval: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - core

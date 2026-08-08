@@ -1,0 +1,55 @@
+services:
+  radicale:
+    image: tomsquest/docker-radicale
+    container_name: radicale
+    restart: unless-stopped
+    volumes:
+    - ${CONFIG}/radicale/data:/data
+    - ${CONFIG}/radicale/config:/config
+    networks:
+    - core
+    expose:
+    - "5232"
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+    - TZ=${TZ}
+    # Vaultwarden's own env key happens to be DOMAIN too; the ${DOMAIN} on the
+    # right is interpolated by compose from .env, not from this.
+    - DOMAIN=https://pass.${DOMAIN}
+    # Nothing in this block may be quoted. Compose's list syntax splits an entry
+    # on the first '=' as one scalar, so YAML never strips the quotes:
+    # SIGNUPS_ALLOWED="false" is seven characters, vaultwarden cannot parse it
+    # as a bool, and it falls back to the built-in default of TRUE -- open
+    # registration on a password manager. (The map syntax minecraft.yml uses is
+    # the one where quoting is harmless.)
+    - SIGNUPS_ALLOWED=false
+    - ADMIN_TOKEN=${VAULTWARDEN_ADMIN_TOKEN}
+    - WEBSOCKET_ENABLED=true
+    volumes:
+    - ${CONFIG}/vaultwarden:/data
+    networks:
+    - core
+    expose:
+    - "80"
+  syncthing:
+    image: syncthing/syncthing:latest
+    container_name: syncthing
+    hostname: bmo-syncthing
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/syncthing:/var/syncthing
+    - ${DATA}/sync:/data
+    network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      test: curl -fkLsS -m 2 http://127.0.0.1:8384/rest/noauth/health | grep -o --color=never
+        OK || exit 1
+      interval: 1m
+      timeout: 10s
+      retries: 3

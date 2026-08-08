@@ -1,0 +1,88 @@
+{
+    acme_dns cloudflare {env.CF_API_TOKEN}
+}
+
+view.{{DOMAIN}} {
+  reverse_proxy minecraft-server:8100
+}
+
+dav.{{DOMAIN}} {
+    redir /.well-known/caldav / 301
+    redir /.well-known/carddav / 301
+    reverse_proxy radicale:5232
+}
+
+photos.{{DOMAIN}} {
+  reverse_proxy immich_server:2283
+}
+
+pass.{{DOMAIN}} {
+  reverse_proxy vaultwarden:80
+}
+
+status.{{DOMAIN}} {
+  reverse_proxy uptime-kuma:3001
+}
+
+sync.{{DOMAIN}} {
+  reverse_proxy host.docker.internal:8384
+}
+
+games.{{DOMAIN}} {
+    reverse_proxy romm:8080
+}
+
+watch.{{DOMAIN}} {
+  reverse_proxy jellyfin:8096
+}
+
+discover.{{DOMAIN}} {
+  reverse_proxy seerr:5055
+}
+
+listen.{{DOMAIN}} {
+    reverse_proxy navidrome:4533
+}
+
+findmusic.{{DOMAIN}} {
+    reverse_proxy aurral:3001
+}
+
+invite.{{DOMAIN}} {
+  reverse_proxy wizarr:5690
+}
+
+slskd.{{DOMAIN}} {
+    reverse_proxy slskd:5030 {
+        header_up Upgrade {http.request.header.Upgrade}
+        header_up Connection "Upgrade"
+    }
+}
+
+radarr.{{DOMAIN}} {
+  reverse_proxy radarr:7878
+}
+
+sonarr.{{DOMAIN}} {
+  reverse_proxy sonarr:8989
+}
+
+bazarr.{{DOMAIN}} {
+  reverse_proxy bazarr:6767
+}
+
+lidarr.{{DOMAIN}} {
+  reverse_proxy lidarr:8686
+}
+
+prowlarr.{{DOMAIN}} {
+  reverse_proxy prowlarr:9696
+}
+
+autobrr.{{DOMAIN}} {
+  reverse_proxy autobrr:7474
+}
+
+qbittorrent.{{DOMAIN}} {
+  reverse_proxy qbittorrent:8080
+}

@@ -1,0 +1,169 @@
+# Directories created by run.sh, one per line. Variables come from
+# config/site.env.
+#
+# A line may carry a GROUP: prefix, which decides *when* in the run it is
+# created. Anything living on a filesystem that gets mounted must not be
+# created before that mount, or it lands on / and the mount then shadows
+# it -- invisible, and quietly filling the root disk.
+#
+#   (none)    $DOCKER_ROOT and $CONFIG. Always on the root filesystem,
+#             so created immediately.
+#   DATA:     created only once $DATA is mounted, or once fstab confirms
+#             it was never meant to be a separate disk.
+#   NAS:      created after the NFS export is mounted. Skipped entirely
+#             in --minimal, which exits before that step.
+#
+# A line may carry an optional trailing owner field:
+#
+#   uid:gid   override the default ownership of $PUID:$PGID, for images
+#             that run as a fixed uid of their own
+#   -         create it but never chown it, and never check it, for
+#             directories whose ownership belongs to the service rather
+#             than to us
+#
+# Ownership is applied on creation only. An existing directory with
+# unexpected ownership is reported, not changed.
+#
+# A service running as root is NOT by itself a reason for `-`. Root
+# writes happily into a $PUID-owned directory and leaves the ownership
+# alone: caddy, jellyfin and vaultwarden all run as root and are all
+# $PUID:$PGID on bmo. Only two things actually produce a directory whose
+# owner is not ours to expect --
+#
+#   1. a service that chowns its own data directory to its own uid
+#      (the database engines: immich/database is 999:1000, romm/mysql
+#      is 999:999)
+#   2. one Docker auto-created as root:root before this file covered it,
+#      which is never corrected afterwards because ownership is applied
+#      on creation only (gluetun, the romm subdirectories)
+#
+# Those get `-`. Everything else keeps the default, and a mismatch there
+# is a real finding.
+#
+# To settle what an image actually does, ask the disk, on the host:
+#
+#   find $CONFIG -maxdepth 2 -type d -printf '%U:%G  %p\n' | sort -k2
+#
+# Do NOT use `docker exec <c> id -u` for this. It reports the uid of the
+# exec process, which for every s6-overlay image (all the lscr.io ones,
+# and tomsquest/docker-radicale) is root -- s6 starts as root and only
+# then drops the application to PUID. radicale reports uid 0 that way
+# while its data genuinely needs 2999:2999. Ownership on disk is what
+# the container actually did, and it is the thing this file describes.
+#
+# Every path that a compose file bind-mounts belongs here. Docker creates
+# a missing bind-mount source itself, as root:root, which any container
+# running as a non-root user then cannot write to.
+
+${DOCKER_ROOT}
+${DOCKER_ROOT}/scripts
+${DOCKER_ROOT}/stacks
+${DOCKER_ROOT}/build/caddy
+
+${CONFIG}/aurral
+${CONFIG}/autobrr
+${CONFIG}/autobrr/config
+${CONFIG}/bazarr
+${CONFIG}/caddy
+${CONFIG}/caddy/config
+${CONFIG}/caddy/data
+${CONFIG}/cross-seed
+# glance and uptime-kuma below belong to stacks/info.yml, which
+# compose.yml does not include; kavita has no stack at all. The three
+# directories are kept on purpose, so the state is already in place when
+# they are switched on.
+#
+# What that costs: an empty directory still goes into every snapshot, and
+# `bmo-restore --all` enumerates services from the snapshot's $CONFIG
+# children -- so each shows up as a service of its own. That is an empty
+# step, not a wrong restore. gotify was a fourth and was dropped instead.
+${CONFIG}/glance
+# Docker created these as root:root before this file covered them, and
+# gluetun runs as root (NET_ADMIN for the wireguard interface) so it has
+# no reason to change them. Confirmed 0:0 on bmo.
+${CONFIG}/gluetun          -
+${CONFIG}/gluetun/servers  -
+${CONFIG}/immich
+# postgres chowns its own data directory to its own uid at startup
+# (999:1000 on bmo)
+${CONFIG}/immich/database  -
+${CONFIG}/jellyfin
+${CONFIG}/jellyfin/cache
+${CONFIG}/kavita
+${CONFIG}/lidarr
+${CONFIG}/navidrome
+${CONFIG}/prowlarr
+${CONFIG}/qbittorrent
+${CONFIG}/radarr
+# tomsquest/docker-radicale runs its application as a fixed uid 2999,
+# not PUID/PGID. Only /data is written by it and needs to be owned by it.
+# /config it merely reads, and on bmo it is $PUID:$PGID and working --
+# which is also the more useful owner, since it keeps the config
+# hand-editable without sudo.
+${CONFIG}/radicale
+${CONFIG}/radicale/config
+${CONFIG}/radicale/data    2999:2999
+${CONFIG}/recyclarr
+${CONFIG}/romm
+# romm runs as root and Docker created these as root:root before this
+# file covered them; ownership was never corrected because it is applied
+# on creation only. All 0:0 on bmo and working, so leave them to it
+# rather than printing a chown on every run.
+${CONFIG}/romm/assets     -
+${CONFIG}/romm/config     -
+# mariadb chowns its own data directory at startup (999:999 on bmo)
+${CONFIG}/romm/mysql      -
+${CONFIG}/romm/redis      -
+${CONFIG}/romm/resources  -
+${CONFIG}/seerr
+${CONFIG}/slskd
+${CONFIG}/sonarr
+${CONFIG}/syncthing
+# technitium runs as root and chowns its whole /etc/dns tree to root;
+# all 0:0 on bmo, including the subdirectories it creates itself
+${CONFIG}/technitium  -
+${CONFIG}/unpackerr
+${CONFIG}/uptime-kuma
+${CONFIG}/vaultwarden
+${CONFIG}/wizarr
+
+# $DATA holds only what a container actually mounts from it: immich's
+# library, syncthing's tree, and the minecraft world. Media and downloads
+# live on the NAS.
+#
+# There used to be ${DATA}/media/{anime,books,movies,music,tv} and
+# ${DATA}/downloads/{cross-seed,music,torrents,usenet} here as well.
+# Nothing mounted them -- every *arr, qBittorrent, Jellyfin, Navidrome
+# and slskd mounts ${NAS}, so those paths were invisible from inside
+# every container. They were pre-NAS copies, and on bmo they had been
+# quietly sitting on the SSD ever since, getting swept into the backup.
+# Removed 2026-08-03. Do not add them back without a compose file that
+# mounts them: the /data/media/... paths visible in the *arr web panels
+# are the NAS, not this disk.
+DATA:${DATA}/games/minecraft
+DATA:${DATA}/photos/backups
+DATA:${DATA}/photos/encoded-video
+DATA:${DATA}/photos/library
+DATA:${DATA}/photos/profile
+DATA:${DATA}/photos/thumbs
+DATA:${DATA}/photos/upload
+DATA:${DATA}/sync/notes
+
+NAS:${NAS}/downloads/cross-seed
+NAS:${NAS}/downloads/music
+NAS:${NAS}/downloads/torrents
+NAS:${NAS}/downloads/usenet
+NAS:${NAS}/media/anime
+NAS:${NAS}/media/books
+NAS:${NAS}/media/games
+NAS:${NAS}/media/movies
+NAS:${NAS}/media/music
+NAS:${NAS}/media/tv
+# stacks/matrix.yml, which compose.yml does not include -- kept for the
+# same reason as the $CONFIG entries above, and here it is load-bearing
+# rather than merely tidy: synapse binds this path with
+# create_host_path: false, so without it the stack fails to start on a
+# perfectly healthy NAS with "bind source path does not exist", which
+# reads as an outage rather than a missing directory. Costs nothing in
+# the backup either way -- $NAS is not backed up.
+NAS:${NAS}/matrix/media

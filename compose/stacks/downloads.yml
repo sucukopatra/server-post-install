@@ -1,0 +1,134 @@
+services:
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/prowlarr:/config
+    restart: unless-stopped
+    networks:
+    - core
+    expose:
+    - "9696"
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+    - TZ=${TZ}
+    - LOG_LEVEL=info
+    restart: unless-stopped
+    networks:
+    - core
+  unpackerr:
+    image: golift/unpackerr:latest
+    container_name: unpackerr
+    user: ${PUID}:${PGID}
+    restart: unless-stopped
+    volumes:
+    - ${NAS}:/data
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /nas-mounted
+      read_only: true
+      bind:
+        create_host_path: false
+    environment:
+    - TZ=${TZ}
+    - UN_LOG_FILE=/data/unpackerr.log
+    - UN_SONARR_0_URL=http://sonarr:8989
+    - UN_SONARR_0_API_KEY=${SONARR_API_KEY}
+    - UN_SONARR_0_PATHS_0=/data/downloads
+    - UN_RADARR_0_URL=http://radarr:7878
+    - UN_RADARR_0_API_KEY=${RADARR_API_KEY}
+    - UN_RADARR_0_PATHS_0=/data/downloads
+    - UN_LIDARR_0_URL=http://lidarr:8686
+    - UN_LIDARR_0_API_KEY=${LIDARR_API_KEY}
+    - UN_LIDARR_0_PATHS_0=/data/downloads
+    depends_on:
+    - sonarr
+    - radarr
+    - lidarr
+    networks:
+    - core
+  autobrr:
+    container_name: autobrr
+    image: ghcr.io/autobrr/autobrr:latest
+    restart: unless-stopped
+    user: ${PUID}:${PGID}
+    environment:
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/autobrr/config:/config
+    networks:
+    - core
+    expose:
+    - "7474"
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TZ=${TZ}
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
+      - VPN_PORT_FORWARDING=on
+      - PORT_FORWARD_ONLY=on
+      - FIREWALL_INPUT_PORTS=8080
+      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -O- --retry-connrefused --post-data "json={\"listen_port\":{{PORTS}}}" http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1'
+      - VPN_PORT_FORWARDING_DOWN_COMMAND=/bin/sh -c 'wget -O- --retry-connrefused --post-data "json={\"listen_port\":0}" http://127.0.0.1:8080/api/v2/app/setPreferences 2>&1'
+    volumes:
+      - ${CONFIG}/gluetun:/gluetun
+    restart: unless-stopped
+    networks:
+      core:
+        aliases:
+          - qbittorrent
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - WEBUI_PORT=8080
+    volumes:
+      - ${CONFIG}/qbittorrent:/config
+      - ${NAS}:/data
+      # NAS mount guard -- see compose.yml
+      - type: bind
+        source: ${NAS}/media
+        target: /nas-mounted
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+  cross-seed:
+    image: ghcr.io/cross-seed/cross-seed:latest
+    container_name: cross-seed
+    user: ${PUID}:${PGID}
+    volumes:
+      - ${CONFIG}/cross-seed:/config
+      - ${NAS}:/data
+      # NAS mount guard -- see compose.yml
+      - type: bind
+        source: ${NAS}/media
+        target: /nas-mounted
+        read_only: true
+        bind:
+          create_host_path: false
+    command: daemon
+    restart: unless-stopped
+    networks:
+      - core

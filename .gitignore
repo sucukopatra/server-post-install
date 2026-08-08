@@ -1,0 +1,11 @@
+secrets/*
+!secrets/*.sops
+*.env
+*.key
+keys.txt
+age-key*.txt
+*.swp
+.DS_Store
+CLAUDE.md
+.claude/
+issues.md

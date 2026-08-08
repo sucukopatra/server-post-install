@@ -1,0 +1,35 @@
+[Unit]
+Description=Run docker update script on boot
+After=docker.service network-online.target
+Wants=network-online.target
+
+# Must match DATA in config/site.env; systemd cannot expand a variable
+# here, so run.sh rewrites this path at install time. Pulls in the mount
+# and orders after it, so `up -d` waits for the data disk instead of
+# racing it -- and if the disk never arrives, this unit does not run at
+# all rather than starting Immich against an empty directory.
+#
+# Deliberately NOT on docker.service itself: that is a hard dependency,
+# so a dead data disk would stop dockerd outright and take technitium's
+# LAN DNS down with it. The immutable bit run.sh sets on the bare $DATA
+# mountpoint is what protects the containers dockerd starts on its own.
+# Harmless if $DATA is not a separate volume -- the path then resolves to
+# the root mount, which is always satisfied.
+RequiresMountsFor=/srv/data
+
+[Service]
+Type=oneshot
+# Path must match DOCKER_ROOT in config/site.env. systemd cannot expand a
+# variable here, so run.sh rewrites it at install time.
+ExecStart=/srv/docker/scripts/update.sh
+
+# Type=oneshot is subject to the start timeout, which defaults to 90s.
+# update.sh rebuilds caddy from source (xcaddy, minutes) and pulls every
+# image, so the default is far too short. It used to be actively
+# dangerous, back when `down` ran first: the timeout killed the unit
+# after the stack was down and before it came back up, leaving bmo with
+# nothing running after a reboot.
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

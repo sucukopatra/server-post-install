@@ -1,0 +1,23 @@
+[Unit]
+Description=Daily restic backup to the NAS
+Documentation=man:restic(1)
+
+[Timer]
+Unit=bmo-backup.service
+
+# 03:30 local time (TZ from config/site.env): after the nightly *arr and
+# cross-seed churn has settled, well before anyone is awake to use the
+# services.
+OnCalendar=*-*-* 03:30:00
+
+# bmo is not guaranteed to be powered on at 03:30. Without this, every
+# missed window is simply lost and the repository quietly develops gaps.
+# With it, a missed run fires shortly after the next boot.
+Persistent=true
+
+# Keeps a catch-up run at boot from landing on top of docker-update.service
+# pulling every image at once. Irrelevant for the normal 03:30 firing.
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

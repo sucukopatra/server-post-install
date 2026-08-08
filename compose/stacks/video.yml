@@ -1,0 +1,138 @@
+services:
+  jellyfin:
+    image: jellyfin/jellyfin
+    container_name: jellyfin
+    environment:
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/jellyfin:/config
+    - ${CONFIG}/jellyfin/cache:/cache
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /media
+      bind:
+        create_host_path: false
+    expose:
+    - "8096"
+    ports:
+    - 7359:7359/udp
+    devices:
+    - /dev/dri:/dev/dri
+    restart: unless-stopped
+    networks:
+    - core
+  seerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    init: true
+    container_name: seerr
+    environment:
+    - LOG_LEVEL=info
+    - TZ=${TZ}
+    - PORT=5055
+    volumes:
+    - ${CONFIG}/seerr:/app/config
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:5055/api/v1/status
+        || exit 1
+      start_period: 20s
+      timeout: 3s
+      interval: 15s
+      retries: 3
+    restart: unless-stopped
+    networks:
+    - core
+    expose:
+    - "5055"
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/radarr:/config
+    - ${NAS}:/data
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /nas-mounted
+      read_only: true
+      bind:
+        create_host_path: false
+    restart: unless-stopped
+    networks:
+    - core
+    expose:
+    - "7878"
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/sonarr:/config
+    - ${NAS}:/data
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /nas-mounted
+      read_only: true
+      bind:
+        create_host_path: false
+    restart: unless-stopped
+    networks:
+    - core
+    expose:
+    - "8989"
+  recyclarr:
+    image: ghcr.io/recyclarr/recyclarr:8
+    container_name: recyclarr
+    user: ${PUID}:${PGID}
+    environment:
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/recyclarr:/config
+    restart: unless-stopped
+    networks:
+    - core
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/bazarr:/config
+    - ${NAS}:/data
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /nas-mounted
+      read_only: true
+      bind:
+        create_host_path: false
+    restart: unless-stopped
+    networks:
+    - core
+    expose:
+    - "6767"
+  wizarr:
+    image: ghcr.io/wizarrrr/wizarr:latest
+    container_name: wizarr
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    - DISABLE_BUILTIN_AUTH=false
+    volumes:
+    - ${CONFIG}/wizarr:/data
+    restart: unless-stopped
+    networks:
+    - core
+    expose:
+    - "5690"

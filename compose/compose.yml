@@ -1,0 +1,26 @@
+# docker.service is only ordered after the $NAS mount unit, not required by
+# it, so dockerd can start with the NFS export missing. A bind of a missing
+# $NAS does not fail -- the container just sees an empty directory, which for
+# jellyfin means a library scan that prunes items and their watch state.
+#
+# So every $NAS bind names a path that exists only INSIDE the export and sets
+# `bind: create_host_path: false`, making the container refuse to start rather
+# than start against nothing. Services that need $NAS as one mount keep
+# ${NAS}:/data (splitting it would cost hardlinks and atomic moves) and take a
+# second read-only bind of ${NAS}/media at /nas-mounted purely as that guard.
+
+include:
+  - stacks/downloads.yml
+#  - stacks/info.yml
+  - stacks/music.yml
+  - stacks/network.yml
+  - stacks/photos.yml
+  - stacks/sync.yml
+  - stacks/video.yml
+  - stacks/games.yml
+  - stacks/minecraft.yml
+
+networks:
+  core:
+    name: core
+    external: true

@@ -1,0 +1,30 @@
+services:
+  glance:
+    container_name: glance
+    hostname: bmo
+    image: glanceapp/glance
+    restart: unless-stopped
+    volumes:
+    - ${CONFIG}/glance:/app/config
+    # No host mounts, deliberately. glance reads its own /proc for CPU and
+    # memory, so /proc, /sys and /:/rootfs:ro did nothing except give a
+    # container that fetches remote feeds read access to .env, the restic
+    # password file and the age key. For host disk usage, mount the one path
+    # you care about (e.g. /srv/data:/host/data:ro) and select it in the
+    # server-stats widget's mountpoints, never the filesystem root.
+    networks:
+    - core
+    expose:
+    - "8080"
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    container_name: uptime-kuma
+    restart: unless-stopped
+    environment:
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/uptime-kuma:/app/data
+    networks:
+    - core
+    expose:
+    - "3001"

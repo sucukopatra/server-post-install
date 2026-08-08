@@ -1,0 +1,68 @@
+# Add to compose.yml's include list. Requires SYNAPSE_DB_PASSWORD in .env.
+
+services:
+  synapse-db:
+    image: postgres:16-alpine
+    container_name: synapse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: ${SYNAPSE_DB_PASSWORD}
+      POSTGRES_DB: synapse
+      # Mandatory: synapse refuses any other collation, and it can only be set
+      # at initdb time -- fixing it later means dump/restore.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - ${CONFIG}/synapse/db:/var/lib/postgresql/data
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  synapse:
+    image: ghcr.io/element-hq/synapse:latest
+    container_name: synapse
+    restart: unless-stopped
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      UID: 1000
+      GID: 1000
+    volumes:
+      - ${CONFIG}/synapse/data:/data
+      # Must match media_store_path in homeserver.yaml.
+      # NAS mount guard -- see compose.yml
+      - type: bind
+        source: ${NAS}/matrix/media
+        target: /data/media_store
+        bind:
+          create_host_path: false
+    networks:
+      - core
+    depends_on:
+      synapse-db:
+        condition: service_healthy
+
+  element:
+    image: ghcr.io/element-hq/element-web:latest
+    container_name: element
+    restart: unless-stopped
+    volumes:
+      - ${CONFIG}/element/config.json:/app/config.json:ro
+    networks:
+      - core
+
+  # TURN relay. network_mode: host is NOT optional -- the relay range is
+  # 49152-65535, and in bridge mode Docker spawns one docker-proxy process per
+  # published port, ~16,000 of them, which exhausts memory and hangs bmo.
+  # Keep this commented out until the public IPv4 lands: it cannot work behind
+  # CGNAT and will just log failures.
+  coturn:
+    image: coturn/coturn:latest
+    container_name: coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ${CONFIG}/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro

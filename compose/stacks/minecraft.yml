@@ -1,0 +1,52 @@
+services:
+  minecraft-server:
+    image: itzg/minecraft-server:latest
+    container_name: minecraft-server
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    ports:
+      - "25565:25565"
+      - "8100:8100"
+    environment:
+      EULA: "TRUE"
+      TYPE: "FABRIC"
+      MEMORY: "8192M"
+      MOTD: "helo"
+      USE_MEOWICE_FLAGS: "true"
+      TZ: ${TZ}
+      DIFFICULTY: "2"
+      ONLINE_MODE: "false"
+      OPS: |-
+        sucukopatra
+      EXISTING_OPS_FILE: "SYNCHRONIZE"
+      MODRINTH_PROJECTS: |-
+        lithium
+        krypton
+        ferrite-core
+        c2me-fabric
+        chunky
+        debugify
+        modernfix?
+        bluemap?
+        alternate-current
+        noisiumforked
+        spark
+        terralith
+        remove-terralith-intro-message
+        tectonic
+        sparsestructures
+        dungeons-and-taverns
+        explorify
+        improved-village-placement
+        structory
+        nullscape
+        amplified-nether
+        vanilla-refresh?
+      MODRINTH_DOWNLOAD_DEPENDENCIES: "none"
+      MODRINTH_ALLOWED_VERSION_TYPE: "alpha"
+      ANNOUNCE_PLAYER_ACHIEVEMENTS: "true"
+    volumes:
+      - "${DATA}/games/minecraft:/data"
+    networks:
+      - core

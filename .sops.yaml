@@ -1,0 +1,5 @@
+# Public key only -- safe to commit. The matching private key lives in
+# your password manager, on paper, and on your desktop. Never here.
+creation_rules:
+  - path_regex: secrets/env\.sops$
+    age: age1utdp6enjhcrcxtjxxzkk6rwqap8mjf979wj7c2erkytywymq93pqndkal0

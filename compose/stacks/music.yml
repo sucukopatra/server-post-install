@@ -1,0 +1,107 @@
+services:
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:nightly
+    container_name: lidarr
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    volumes:
+    - ${CONFIG}/lidarr:/config
+    - ${NAS}:/data
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /nas-mounted
+      read_only: true
+      bind:
+        create_host_path: false
+    restart: unless-stopped
+    networks:
+    - core
+    expose:
+    - "8686"
+  slskd:
+    image: slskd/slskd
+    container_name: slskd
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    - SLSKD_REMOTE_CONFIGURATION=true
+    volumes:
+    - ${CONFIG}/slskd:/app
+    - ${NAS}:/data
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /nas-mounted
+      read_only: true
+      bind:
+        create_host_path: false
+    expose:
+    - "5030"
+    - "5031"
+    ports:
+    - 50300:50300
+    restart: unless-stopped
+    networks:
+    - core
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    user: ${PUID}:${PGID}
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      TZ: ${TZ}
+      ND_MUSICFOLDER: /data/media/music
+      ND_DATAFOLDER: /config
+      ND_CACHEFOLDER: /config/cache
+      ND_LOGLEVEL: info
+      ND_SESSIONTIMEOUT: 24h
+      ND_LASTFM_ENABLED: 'true'
+      ND_LASTFM_APIKEY: ${LASTFM_API_KEY}
+      ND_LASTFM_SECRET: ${LASTFM_SECRET}
+      ND_SCANNER_PURGEMISSING: always
+    volumes:
+    - ${CONFIG}/navidrome:/config
+    - ${NAS}:/data
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/media
+      target: /nas-mounted
+      read_only: true
+      bind:
+        create_host_path: false
+    expose:
+    - "4533"
+    restart: unless-stopped
+    networks:
+    - core
+    depends_on:
+    - lidarr
+  aurral:
+    image: ghcr.io/lklynet/aurral:latest
+    container_name: aurral
+    environment:
+    - PUID=${PUID}
+    - PGID=${PGID}
+    - TZ=${TZ}
+    - DOWNLOAD_FOLDER=${NAS}/downloads/music
+    - TRUST_PROXY=true
+    expose:
+    - "3001"
+    restart: unless-stopped
+    volumes:
+    # NAS mount guard -- see compose.yml
+    - type: bind
+      source: ${NAS}/downloads/music
+      target: /app/downloads
+      bind:
+        create_host_path: false
+    - ${CONFIG}/aurral:/app/backend/data
+    networks:
+    - core
+    depends_on:
+    - lidarr

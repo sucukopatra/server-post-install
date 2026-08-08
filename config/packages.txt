@@ -1,0 +1,35 @@
+# Packages installed by run.sh. Debian base packages are omitted --
+# only things deliberately chosen. Comments and blanks ignored.
+
+# --- shell / core tooling ---
+git
+curl
+rsync
+vim
+neovim
+nano
+tmux
+tree
+unzip
+zip
+# `unrar` proper is in non-free, which a default Debian install does not
+# enable; unrar-free is in main and is what unpackerr needs.
+unrar-free
+bash-completion
+ncdu
+restic
+sqlite3
+
+# --- networking ---
+nfs-common
+ufw
+ethtool
+tcpdump
+traceroute
+bind9-dnsutils
+speedtest-cli
+tailscale
+
+# --- misc ---
+cockpit
+cockpit-files

@@ -1,0 +1,63 @@
+[Unit]
+Description=restic backup of CONFIG and DATA to the NAS
+Documentation=man:restic(1)
+
+# The repository is reached over SSH (sftp:nas:...), so this needs the
+# network -- but deliberately NOT srv-nas.mount. Nothing under $NAS is
+# backed up, and requiring the NFS mount would block the backup of the
+# local disks whenever the NAS is slow to come up.
+Wants=network-online.target
+After=network-online.target
+
+# Dumps run through `docker exec`. Ordering only: if docker is down the
+# script still backs up the files and reports the missed dumps, which is
+# better than not running at all.
+After=docker.service
+
+# On a boot where the timer is catching up (Persistent=true), let the
+# image pull finish first so dumps aren't taken from containers that are
+# mid-restart. A no-op when docker-update.service isn't enabled.
+After=docker-update.service
+
+# Must match DATA in config/site.env; systemd cannot expand a variable
+# here, so run.sh rewrites this path at install time. Pulls in the mount
+# and orders after it, so a catch-up run at boot waits for the disk
+# instead of racing it.
+# Harmless if $DATA is not a separate volume. The script refuses to run
+# on an unmounted $DATA regardless -- this just makes it wait first.
+RequiresMountsFor=/srv/data
+
+# No ConditionPathExists=/etc/bmo-backup.env on purpose: a missing config
+# should fail loudly with the script's own message, not show up as a
+# silently "skipped" unit that nobody notices for months.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bmo-backup
+
+# Type=oneshot is subject to the start timeout, which defaults to 90s --
+# that kills a real backup partway through. Must be disabled, not merely
+# raised: prune and check time grow with the repository.
+TimeoutStartSec=0
+
+# Stay out of the way of anything actually serving users. best-effort/7
+# rather than the idle class, which can starve the job indefinitely on a
+# box that is always doing some I/O.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Deliberately not sandboxed. This runs as root because it has to: it
+# reads every application's state under $CONFIG, root's SSH key for the
+# NAS, and the repository passphrase. ProtectHome/ProtectSystem/
+# ReadOnlyPaths would each need an exception carved out for one of those,
+# and the failure mode is a backup that silently stops covering something.
+# The script's own guards are the safety net here.
+
+# restic's cache is left at its default, /root/.cache/restic. Pointing it
+# somewhere else here would give timer runs and manual `sudo bmo-backup`
+# runs two separate caches, so every hand-run would re-fetch the index.
+
+# No [Install] section: this unit is driven by bmo-backup.timer and must
+# not be enabled on its own. `systemctl start bmo-backup.service` still
+# works for an on-demand run.
