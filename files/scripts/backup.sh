@@ -135,8 +135,22 @@ CHECK_INTERVAL_DAYS="${CHECK_INTERVAL_DAYS:-7}"
 # excluded from the backup and whose dump is the only copy.
 DUMP_KEEP_DAYS="${DUMP_KEEP_DAYS:-30}"
 
-for v in CHECK_INTERVAL_DAYS DUMP_KEEP_DAYS; do
-  [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number of days, got '${!v}'"
+# How stale a dump may be before the run says so. Independent of
+# DUMP_KEEP_DAYS above, which is about deletion: a dump can be far too old
+# to stand for tonight's database and nowhere near old enough to be
+# removed, and that gap is where a failing dump used to hide. Two nights,
+# so a single failure tonight's run has already made good is not reported.
+DUMP_STALE_HOURS="${DUMP_STALE_HOURS:-48}"
+
+# How long to wait for a database container to start answering before
+# giving up on its dump. Generous on purpose: this runs at 03:30 with
+# nobody waiting, and crash recovery on a large database is minutes, while
+# the cost of not waiting is a night with no dump. Only containers that
+# are already up are waited on, so a stopped service costs nothing.
+DB_READY_TIMEOUT="${DB_READY_TIMEOUT:-300}"
+
+for v in CHECK_INTERVAL_DAYS DUMP_KEEP_DAYS DUMP_STALE_HOURS DB_READY_TIMEOUT; do
+  [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number, got '${!v}'"
 done
 
 command -v restic >/dev/null || die "restic is not installed"
@@ -211,6 +225,80 @@ running() {
   [[ $(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]
 }
 
+# Wait for a database container to be able to answer queries.
+#
+# `running` above is not this, and the difference is the whole point. A
+# container is "running" from the moment the engine forks -- through
+# initdb, through crash recovery, before the socket is even bound -- so
+# dumping on that signal alone produces exactly the two failures this
+# exists to stop: "Connection refused" before the bind, and "the database
+# system is starting up" after it. Docker health status does mean
+# something, and every engine image on this host declares one. $probe is
+# the fallback for an image that ever drops its healthcheck, so this
+# cannot quietly degrade back to "the process exists".
+#
+# A timeout here is advisory, not fatal: both callers warn and dump
+# anyway. An engine that never reports healthy may still answer queries
+# perfectly well -- the Immich image's healthcheck also fails on detected
+# checksum corruption, which is exactly when its dump matters most -- and
+# refusing to try would lose a dump this script used to take. So the
+# worst this function can do is delay a dump by $DB_READY_TIMEOUT.
+#
+# Deliberately duplicated from restore.sh rather than factored into a
+# shared file. Both scripts are installed standalone into /usr/local/sbin
+# and must keep working when the git checkout they came from is gone --
+# which, for restore.sh, is the situation it is FOR. A library between
+# them is one more thing a partial install can leave behind.
+wait_ready() {
+  local c=$1 probe=${2:-} timeout=${3:-$DB_READY_TIMEOUT}
+  local waited=0 interval=2 state health inspected
+
+  while (( waited < timeout )); do
+    # Status and health in one inspect, not two: this polls every 2s, and
+    # asking the daemon twice per tick for two fields of the same object
+    # is round trips nobody needs. The separator cannot appear in either
+    # value.
+    state=missing health=""
+    if inspected=$(docker inspect \
+         -f '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+         "$c" 2>/dev/null); then
+      state=${inspected%%|*}; health=${inspected#*|}
+    fi
+    case $state in
+      running) ;;
+      # Gone or stopped while we watched. Waiting out the timeout would
+      # only delay the rest of the backup; the caller reports it.
+      missing|exited|dead) return 1 ;;
+      *) sleep "$interval"; waited=$(( waited + interval )); continue ;;
+    esac
+
+    if [[ -n $health ]]; then
+      if [[ $health == healthy ]]; then
+        # Silent on the normal night, when this returns on the first tick
+        # with waited=0. A line here every run would be one more thing to
+        # read past, and the number is only interesting when there was a
+        # wait to report.
+        (( waited )) && log "  $c ready after ${waited}s"
+        return 0
+      fi
+    elif [[ -n $probe ]]; then
+      if docker exec "$c" sh -c "$probe" >/dev/null 2>&1; then
+        (( waited )) && log "  $c answering after ${waited}s"
+        return 0
+      fi
+    else
+      # No healthcheck and no probe: there is nothing to wait on, and
+      # dumping blind is what this script did before this function
+      # existed. Still better than skipping the dump.
+      return 0
+    fi
+
+    sleep "$interval"; waited=$(( waited + interval ))
+  done
+
+  return 1
+}
+
 # Temp file and rename, so an interrupted dump cannot replace a good one
 # with a truncated one. stderr is left alone: when a dump fails, the
 # engine's own message in the journal is the only useful diagnosis.
@@ -232,6 +320,8 @@ dump_to() {
 dump_postgres() {
   local container=$1
   running "$container" || return 0
+  wait_ready "$container" 'exec pg_isready -U "${POSTGRES_USER:-postgres}"' \
+    || warn "$container not ready after ${DB_READY_TIMEOUT}s -- dumping anyway"
   # The official image trusts local socket connections, so no credentials
   # are needed here.
   dump_to "$DUMP_DIR/$container.sql" \
@@ -244,6 +334,8 @@ dump_postgres() {
 dump_mariadb() {
   local container=$1
   running "$container" || return 0
+  wait_ready "$container" 'export MYSQL_PWD="$MARIADB_ROOT_PASSWORD"; exec mariadb-admin -u root ping' \
+    || warn "$container not ready after ${DB_READY_TIMEOUT}s -- dumping anyway"
   # MYSQL_PWD rather than -p keeps the password out of the container's
   # process list.
   dump_to "$DUMP_DIR/$container.sql" \
@@ -316,12 +408,25 @@ check_immich_dump() {
   local dir="$DATA/photos/backups" newest total
   running immich_postgres || return 0
 
-  newest=$(find "$dir" -type f -newermt '-48 hours' -print -quit 2>/dev/null || true)
+  # Matched by name, not "any file under $dir". Immich drops a `.immich`
+  # marker file into the directories it owns and touches it on startup,
+  # and with `-print -quit` taking whatever the directory order hands over
+  # first, that marker is what this reported as the current dump -- so the
+  # one check standing between a broken Immich backup setting and an
+  # unrestorable snapshot passed on the strength of a zero-byte marker.
+  #
+  # Loose about what follows the prefix (the name carries a timestamp and
+  # the server and PostgreSQL versions, and that scheme has changed
+  # before) and strict about the prefix, which has not. A rename upstream
+  # therefore reads as "no dump" -- a false alarm, which is the right way
+  # for this particular check to be wrong.
+  local pat='immich-db-backup-*.sql*'
+  newest=$(find "$dir" -type f -name "$pat" -newermt '-48 hours' -print -quit 2>/dev/null || true)
   if [[ -n $newest ]]; then
     log "  immich self-dump is current ($(basename "$newest"))"
   else
-    total=$(find "$dir" -type f 2>/dev/null | wc -l || true)
-    fail "no immich database dump under $dir in the last 48h ($total file(s) total) -- check Immich's backup setting"
+    total=$(find "$dir" -type f -name "$pat" 2>/dev/null | wc -l || true)
+    fail "no immich database dump under $dir in the last 48h ($total dump(s) total) -- check Immich's backup setting"
   fi
 }
 
@@ -427,6 +532,24 @@ for c in "${!SQL_LIVE_DIR[@]}"; do
   [[ -d $live ]] || continue
   if [[ -s $DUMP_DIR/$c.sql ]]; then
     printf '%s\n' "$live" >> "$EXCLUDES"
+
+    # Existence is not freshness, and treating it as freshness is how a
+    # failed dump goes quiet. dump_to keeps the previous good copy when
+    # tonight's dump fails, which is right -- but the exclusion just
+    # written then ships a snapshot whose only copy of this database is
+    # however old that file is, and nothing anywhere said so. The dump
+    # still beats a file-level copy of a live engine, so it stays
+    # excluded and this is loud instead.
+    #
+    # Note what this catches that the dump step cannot: a dump that has
+    # been failing for a week reports one failure per night and looks
+    # like tonight's transient. This reports the thing that actually
+    # matters -- that the snapshot no longer contains a current copy.
+    # DUMP_KEEP_DAYS would eventually notice by deleting the file, three
+    # weeks too late and by then the live directory is unprotected too.
+    if [[ -z $(find "$DUMP_DIR/$c.sql" -newermt "-${DUMP_STALE_HOURS} hours" -print -quit 2>/dev/null) ]]; then
+      fail "$DUMP_DIR/$c.sql has not been refreshed in ${DUMP_STALE_HOURS}h -- the snapshot excludes the live $live in favour of a stale dump"
+    fi
   elif have_docker && running "$c"; then
     # Engine up and no dump: the copy going into the snapshot is being
     # written to as it is read. Worth failing the run over.
