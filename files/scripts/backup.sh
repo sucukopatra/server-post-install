@@ -19,6 +19,7 @@ LOCK_FILE=/run/bmo-backup.lock
 # repository check passed.
 STATE_DIR=/var/lib/bmo-backup
 CHECK_STAMP="$STATE_DIR/last-check"
+VERIFY_STAMP="$STATE_DIR/last-verify"
 
 log()  { printf '%s  %s\n'     "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '%s  WARN: %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
@@ -78,6 +79,9 @@ NO_PING=0
 on_exit() {
   local rc=$? body
   [[ -n ${EXCLUDES:-} ]] && rm -f "$EXCLUDES"
+  # Same trap, not a second one: `trap ... EXIT` installed later would
+  # replace this handler outright and the run would stop reporting.
+  [[ -n ${VERIFY_TMP:-} ]] && rm -rf "$VERIFY_TMP"
   (( NO_PING )) && return
   if (( rc == 0 )); then
     ping_hc "" "${SUMMARY:-backup completed}"
@@ -149,7 +153,16 @@ DUMP_STALE_HOURS="${DUMP_STALE_HOURS:-48}"
 # are already up are waited on, so a stopped service costs nothing.
 DB_READY_TIMEOUT="${DB_READY_TIMEOUT:-300}"
 
-for v in CHECK_INTERVAL_DAYS DUMP_KEEP_DAYS DUMP_STALE_HOURS DB_READY_TIMEOUT; do
+# How often the dumps are read back out of the repository and validated,
+# in days. Separate from CHECK_INTERVAL_DAYS above because they answer
+# different questions: `restic check` asks whether the repository is
+# structurally sound, this asks whether the files it holds are the ones we
+# would need. A sound repository full of truncated dumps passes the first
+# and fails this. 0 means every run; VERIFY_DUMPS=0 disables it outright.
+VERIFY_INTERVAL_DAYS="${VERIFY_INTERVAL_DAYS:-7}"
+
+for v in CHECK_INTERVAL_DAYS DUMP_KEEP_DAYS DUMP_STALE_HOURS DB_READY_TIMEOUT \
+         VERIFY_INTERVAL_DAYS; do
   [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number, got '${!v}'"
 done
 
@@ -299,12 +312,36 @@ wait_ready() {
   return 1
 }
 
+# A dump that exits 0 and is non-empty can still be truncated: a `docker
+# exec` killed mid-stream, a disk that fills at 90%, an engine that errors
+# after emitting half the schema. Both engines close a complete dump with
+# a fixed trailer, so whether that line is present is the difference
+# between "the command ran" and "the dump is whole".
+#
+# tail -c rather than grep over the file: these run over dumps that can be
+# hundreds of megabytes, and the trailer is always the last line.
+valid_pg_dump() {
+  tail -c 200 "$1" | grep -q 'PostgreSQL database cluster dump complete'
+}
+
+valid_mariadb_dump() {
+  tail -c 200 "$1" | grep -q '^-- Dump completed'
+}
+
 # Temp file and rename, so an interrupted dump cannot replace a good one
 # with a truncated one. stderr is left alone: when a dump fails, the
 # engine's own message in the journal is the only useful diagnosis.
+#
+# $validate is the name of a function taking the temp file; it runs before
+# the rename, so a dump that fails it is discarded exactly like a dump
+# whose command exited non-zero, leaving the previous good copy in place.
+# That is the right direction -- a truncated dump is worse than yesterday's
+# complete one -- and it is only safe because the staleness check further
+# down then reports the surviving dump aging out. The two are a pair;
+# removing either one alone puts the silence back.
 dump_to() {
-  local out=$1; shift
-  if "$@" > "$out.tmp" && [[ -s $out.tmp ]]; then
+  local out=$1 validate=$2; shift 2
+  if "$@" > "$out.tmp" && [[ -s $out.tmp ]] && "$validate" "$out.tmp"; then
     mv -f "$out.tmp" "$out"
     log "  dumped $(basename "$out") ($(du -h "$out" | cut -f1))"
     return 0
@@ -324,9 +361,9 @@ dump_postgres() {
     || warn "$container not ready after ${DB_READY_TIMEOUT}s -- dumping anyway"
   # The official image trusts local socket connections, so no credentials
   # are needed here.
-  dump_to "$DUMP_DIR/$container.sql" \
+  dump_to "$DUMP_DIR/$container.sql" valid_pg_dump \
     docker exec "$container" sh -c 'exec pg_dumpall --clean --if-exists -U "$POSTGRES_USER"' \
-    || fail "pg_dumpall failed for $container"
+    || fail "pg_dumpall failed or produced a truncated dump for $container"
 }
 
 # Single-quoted sh -c body again -- see dump_postgres above.
@@ -338,12 +375,12 @@ dump_mariadb() {
     || warn "$container not ready after ${DB_READY_TIMEOUT}s -- dumping anyway"
   # MYSQL_PWD rather than -p keeps the password out of the container's
   # process list.
-  dump_to "$DUMP_DIR/$container.sql" \
+  dump_to "$DUMP_DIR/$container.sql" valid_mariadb_dump \
     docker exec "$container" sh -c '
       export MYSQL_PWD="$MARIADB_ROOT_PASSWORD"
       if command -v mariadb-dump >/dev/null; then d=mariadb-dump; else d=mysqldump; fi
       exec "$d" -u root --all-databases --single-transaction --quick --routines --events' \
-    || fail "mariadb-dump failed for $container"
+    || fail "mariadb-dump failed or produced a truncated dump for $container"
 }
 
 # Everything else here is SQLite. `.backup` uses SQLite's online backup
@@ -378,7 +415,15 @@ dump_sqlite() {
     out="$DUMP_DIR/sqlite/$rel"
     install -d -m 0700 "$(dirname "$out")"
 
-    if sqlite3 "$db" ".backup '$out.tmp'" 2>/dev/null && [[ -s $out.tmp ]]; then
+    # integrity_check on the copy, not the original: the question is
+    # whether the file about to become the only copy in the backup is
+    # sound, and .backup can produce a damaged one from a healthy source
+    # (a disk filling up mid-copy). It returns the single word `ok`, or
+    # one line per problem found. Full check rather than quick_check --
+    # these are application config databases of a few MB and it costs
+    # milliseconds; revisit only if one ever grows enough to be felt.
+    if sqlite3 "$db" ".backup '$out.tmp'" 2>/dev/null && [[ -s $out.tmp ]] \
+       && [[ $(sqlite3 "$out.tmp" 'PRAGMA integrity_check' 2>/dev/null) == ok ]]; then
       # Carry the live file's ownership and mode onto the dump. sqlite3
       # runs as root, so .backup writes root:root 0644, and restore.sh's
       # `cp -a` preserves exactly that -- every restored database owned by
@@ -393,7 +438,7 @@ dump_sqlite() {
       (( ++n ))
     else
       rm -f "$out.tmp"
-      fail "sqlite3 .backup failed for $db"
+      fail "sqlite3 .backup failed or produced a corrupt copy for $db"
     fi
   done < <(find "$CONFIG" -path "$DUMP_DIR" -prune -o \
                 -type f \( -name '*.sqlite3' -o -name '*.sqlite' -o -name '*.db' \) -print)
@@ -666,6 +711,168 @@ else
     fi
   else
     log "repository checked ${since_days}d ago, next in $(( CHECK_INTERVAL_DAYS - since_days ))d"
+  fi
+fi
+
+# ------------------------------------------------------- verifying dumps
+
+# `restic check` above proves the repository is structurally sound. It does
+# not open a single dump. Everything before it proves a dump was *written*.
+# This is the only thing here that proves one can be *read back*, which is
+# the property the whole arrangement rests on: for every database on this
+# host the live files are excluded from the snapshot, so a dump is not a
+# spare copy, it is the copy.
+#
+# Streamed rather than staged wherever a stream is enough. The Immich
+# cluster dump is the largest file in $DUMP_DIR and is already on the root
+# filesystem once; restoring a second copy to look at it is how a
+# verification step fills the disk it exists to protect.
+
+decompress() {
+  if [[ $1 == *.gz ]]; then gzip -dc; else cat; fi
+}
+
+verify_dumps() {
+  local -a filter=( --host "$BACKUP_HOST" --tag "$BACKUP_TAG" )
+  local c path pat tail_out rc imm db rel sdump
+  local n=0 bad=0 unread=0
+
+  VERIFY_TMP=$(mktemp -d)
+  local rcf="$VERIFY_TMP/rc"
+
+  log "verifying dumps in the latest snapshot"
+
+  # `latest` is resolved by restic against --host/--tag rather than parsed
+  # out of `restic snapshots --json`: no jq dependency and no output format
+  # to keep up with.
+  for c in $(printf '%s\n' "${!SQL_ENGINE[@]}" | sort); do
+    path="$DUMP_DIR/$c.sql"
+    # What is on disk is the index of what to look for. A dump present here
+    # must be in the snapshot -- it was written before the backup ran and
+    # its live directory was excluded on the strength of it -- so restic
+    # failing to find it is not a missing file, it is the exclusion logic
+    # being wrong, which is exactly the class of bug this exists to catch.
+    [[ -s $path ]] || continue
+
+    case ${SQL_ENGINE[$c]} in
+      postgres) pat='PostgreSQL database cluster dump complete' ;;
+      mariadb)  pat='^-- Dump completed' ;;
+      *)        continue ;;
+    esac
+
+    # PIPESTATUS is no help across a command substitution -- the pipeline
+    # runs in a subshell and the parent never sees its statuses -- so
+    # restic's own status comes back through a file. Telling "could not
+    # fetch it" apart from "it is corrupt" is the point of the branches
+    # below, and inferring it from empty output would file a zero-byte dump
+    # in the snapshot as a network problem.
+    tail_out=$( { restic "${filter[@]}" dump latest "$path" 2>/dev/null; echo $? >"$rcf"; } \
+                | tail -c 200 )
+    rc=$(<"$rcf")
+
+    if (( rc != 0 )); then
+      warn "  $c.sql: could not be read back from the repository"
+      unread=1
+    elif grep -q "$pat" <<< "$tail_out"; then
+      log "  $c.sql: complete"
+      n=$(( n + 1 ))
+    else
+      fail "$c.sql in the latest snapshot is truncated -- the live database directory is excluded from that snapshot, so this is its only copy"
+      bad=$(( bad + 1 ))
+    fi
+  done
+
+  # Immich's own dump, which is the restore path for that database (see
+  # check_immich_dump above) and so the one worth checking hardest. One
+  # pass does both jobs: decompressing proves the archive is intact, the
+  # trailer proves the dump inside it is whole. The alternation covers
+  # pg_dump and pg_dumpall, which Immich has used at different versions.
+  imm=$(find "$DATA/photos/backups" -type f -name 'immich-db-backup-*.sql*' \
+          -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+  if [[ -n $imm ]]; then
+    tail_out=$( { restic "${filter[@]}" dump latest "$imm" 2>/dev/null; echo $? >"$rcf"; } \
+                | decompress "$imm" 2>/dev/null | tail -c 200 )
+    rc=$(<"$rcf")
+
+    if (( rc != 0 )); then
+      warn "  $(basename "$imm"): could not be read back from the repository"
+      unread=1
+    elif grep -qE 'PostgreSQL database (cluster )?dump complete' <<< "$tail_out"; then
+      log "  $(basename "$imm"): archive and dump both complete"
+      n=$(( n + 1 ))
+    else
+      fail "$(basename "$imm") in the latest snapshot is corrupt or truncated -- this is Immich's restore path"
+      bad=$(( bad + 1 ))
+    fi
+  fi
+
+  # One restore of the whole subtree rather than a `restic dump` per file:
+  # 37 dumps would be 37 repository opens over sftp, and they are small
+  # enough that pulling all of them costs less than the round trips. They
+  # need a real file either way -- integrity_check cannot read a stream.
+  if (( ${#SQLITE_DUMPED[@]} )); then
+    if ! command -v sqlite3 >/dev/null; then
+      # A skip, not a failure, matching how dump_sqlite already treats it.
+      warn "  sqlite3 not installed -- SQLite dumps in the snapshot not verified"
+      unread=1
+    elif ! restic "${filter[@]}" restore latest --target "$VERIFY_TMP/sqlite" \
+             --include "$DUMP_DIR/sqlite" >/dev/null 2>&1; then
+      warn "  could not read the SQLite dumps back from the repository"
+      unread=1
+    else
+      local sn=0 sbad=0
+      for db in "${SQLITE_DUMPED[@]}"; do
+        rel=${db#"$CONFIG"/}
+        sdump="$VERIFY_TMP/sqlite$DUMP_DIR/sqlite/$rel"
+        if [[ ! -s $sdump ]]; then
+          fail "the dump of $db is missing from the latest snapshot -- the live file is excluded from it, so that database is in no copy at all"
+          sbad=$(( sbad + 1 ))
+        elif [[ $(sqlite3 "$sdump" 'PRAGMA integrity_check' 2>/dev/null) != ok ]]; then
+          fail "the dump of $db is corrupt in the latest snapshot"
+          sbad=$(( sbad + 1 ))
+        else
+          sn=$(( sn + 1 ))
+        fi
+      done
+      log "  sqlite/: $sn of $(( sn + sbad )) verified"
+      n=$(( n + sn )); bad=$(( bad + sbad ))
+    fi
+  fi
+
+  if (( bad )); then
+    # Each one has already been reported by fail(); this says how much of
+    # the snapshot is affected. Not stamped, so it re-checks nightly until
+    # it is clean rather than going quiet for another interval.
+    warn "$bad dump(s) in the latest snapshot did not verify"
+  elif (( unread )); then
+    # Deliberately not a failure and deliberately not stamped: an sftp
+    # hiccup is not a corrupt backup, but it must not buy another
+    # VERIFY_INTERVAL_DAYS of silence either.
+    warn "verification incomplete -- retrying on the next run"
+  else
+    log "verified $n dump(s) in the latest snapshot"
+    date +%s > "$VERIFY_STAMP"
+  fi
+}
+
+# Same stamp-file reasoning as the repository check above: bmo is not
+# guaranteed to be powered on on any given day, so an interval measured
+# from the last success is the only schedule that actually happens.
+if [[ ${VERIFY_DUMPS:-1} != 1 ]]; then
+  log "dump verification disabled (VERIFY_DUMPS=0)"
+else
+  install -d -m 0700 "$STATE_DIR"
+  last_verify=0
+  if [[ -r $VERIFY_STAMP ]]; then
+    last_verify=$(<"$VERIFY_STAMP")
+    [[ $last_verify =~ ^[0-9]+$ ]] || last_verify=0
+  fi
+  verify_days=$(( ( $(date +%s) - last_verify ) / 86400 ))
+
+  if (( VERIFY_INTERVAL_DAYS == 0 || verify_days >= VERIFY_INTERVAL_DAYS )); then
+    verify_dumps
+  else
+    log "dumps verified ${verify_days}d ago, next in $(( VERIFY_INTERVAL_DAYS - verify_days ))d"
   fi
 fi
 
