@@ -71,6 +71,7 @@ on_exit() {
   # Same trap, not a second one: `trap ... EXIT` installed later would
   # replace this handler outright and the run would stop reporting.
   [[ -n ${VERIFY_TMP:-} ]] && rm -rf "$VERIFY_TMP"
+  (( ${MC_SAVE_OFF:-0} )) && { mc_rcon save-on || true; }
   (( NO_PING )) && return
   if (( rc == 0 )); then
     ping_hc "" "${SUMMARY:-backup completed}"
@@ -142,13 +143,13 @@ done
 
 command -v restic >/dev/null || die "restic is not installed"
 
-# One run at a time. bmo-restore takes this lock too, so a backup cannot
-# snapshot a half-restored host as `latest` and prune.
+# One run at a time. bmo-restore and docker-update.service take this lock
+# too, so a backup cannot snapshot a half-restored host as `latest` and prune.
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   # No alarm: whoever holds the lock reports for tonight.
   NO_PING=1
-  die "another backup or a restore is already running (holds $LOCK_FILE)"
+  die "another backup, a restore or an image update is already running (holds $LOCK_FILE)"
 fi
 
 # The run really starts here, so the monitor's clock does too.
@@ -362,15 +363,13 @@ check_immich_dump() {
 
 # The engine databases: container, engine, live data directory. One table for
 # the dump loop and the exclusion loop, so a dumped container cannot miss its
-# exclusion. synapse stays listed so enabling matrix.yml is covered.
+# exclusion.
 declare -A SQL_ENGINE=(
   [immich_postgres]=postgres      # immich's own dump is the restore path
-  [synapse-db]=postgres
   [romm-db]=mariadb
 )
 declare -A SQL_LIVE_DIR=(
   [immich_postgres]="$CONFIG/immich/database"
-  [synapse-db]="$CONFIG/synapse/db"
   [romm-db]="$CONFIG/romm/mysql"
 )
 
@@ -427,27 +426,31 @@ EOF
 
 # Live database directories, excluded ONLY when their dump is on disk, so a
 # snapshot can never hold neither.
-for c in "${!SQL_LIVE_DIR[@]}"; do
-  live=${SQL_LIVE_DIR[$c]}
-  # Not deployed here: nothing to exclude and nothing to warn about.
-  [[ -d $live ]] || continue
-  if [[ -s $DUMP_DIR/$c.sql ]]; then
-    printf '%s\n' "$live" >> "$EXCLUDES"
+exclude_sql_dirs() {
+  local c live
+  for c in "${!SQL_LIVE_DIR[@]}"; do
+    live=${SQL_LIVE_DIR[$c]}
+    # Not deployed here: nothing to exclude and nothing to warn about.
+    [[ -d $live ]] || continue
+    if [[ -s $DUMP_DIR/$c.sql ]]; then
+      printf '%s\n' "$live" >> "$EXCLUDES"
 
-    # Existence is not freshness: a dump that keeps failing leaves an old copy in
-    # place, and this is what says the snapshot no longer has a current one.
-    if [[ -z $(find "$DUMP_DIR/$c.sql" -newermt "-${DUMP_STALE_HOURS} hours" -print -quit 2>/dev/null) ]]; then
-      fail "$DUMP_DIR/$c.sql has not been refreshed in ${DUMP_STALE_HOURS}h -- the snapshot excludes the live $live in favour of a stale dump"
+      # Existence is not freshness: a dump that keeps failing leaves an old copy in
+      # place, and this is what says the snapshot no longer has a current one.
+      if [[ -z $(find "$DUMP_DIR/$c.sql" -newermt "-${DUMP_STALE_HOURS} hours" -print -quit 2>/dev/null) ]]; then
+        fail "$DUMP_DIR/$c.sql has not been refreshed in ${DUMP_STALE_HOURS}h -- the snapshot excludes the live $live in favour of a stale dump"
+      fi
+    elif have_docker && running "$c"; then
+      # Engine up and no dump: the copy going into the snapshot is being
+      # written to as it is read. Worth failing the run over.
+      fail "no dump at $DUMP_DIR/$c.sql and $c is running -- keeping the live $live in the backup instead, which may restore torn"
+    else
+      # A stopped engine's data directory copies fine.
+      log "  no dump for $c and it is not running -- backing up the live $live (safe: engine stopped)"
     fi
-  elif have_docker && running "$c"; then
-    # Engine up and no dump: the copy going into the snapshot is being
-    # written to as it is read. Worth failing the run over.
-    fail "no dump at $DUMP_DIR/$c.sql and $c is running -- keeping the live $live in the backup instead, which may restore torn"
-  else
-    # A stopped engine's data directory copies fine.
-    log "  no dump for $c and it is not running -- backing up the live $live (safe: engine stopped)"
-  fi
-done
+  done
+}
+exclude_sql_dirs
 
 # Exclude the live SQLite files whose clean copy is in $DUMP_DIR/sqlite, with
 # their -wal/-shm/-journal sidecars. A failed dump keeps its live file in.
@@ -486,6 +489,13 @@ EOF
 #                          restoring it avoids re-issuing into a rate limit.
 #   $DATA/photos/backups -- Immich's own database dumps (see above).
 
+mc_rcon() { docker exec minecraft-server rcon-cli "$@" >/dev/null 2>&1; }
+MC_SAVE_OFF=0
+if have_docker && running minecraft-server && mc_rcon save-off; then
+  MC_SAVE_OFF=1
+  mc_rcon save-all flush || warn "minecraft save-all failed -- the world may be copied mid-save"
+fi
+
 log "backing up $CONFIG and $DATA"
 if restic backup \
      --host "$BACKUP_HOST" \
@@ -497,6 +507,7 @@ if restic backup \
      "$CONFIG" "$DATA"
 then
   log "backup complete"
+  (( MC_SAVE_OFF )) && mc_rcon save-on && MC_SAVE_OFF=0
 else
   # No prune after a failed backup: retention would be applied against an
   # incomplete picture of what exists.

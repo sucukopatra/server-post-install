@@ -13,7 +13,7 @@ RequiresMountsFor=/srv/data
 Type=oneshot
 # Path must match DOCKER_ROOT in config/site.env. systemd cannot expand a
 # variable here, so run.sh rewrites it at install time.
-ExecStart=/srv/docker/scripts/update.sh
+ExecStart=/usr/bin/flock -w 3600 /run/bmo-backup.lock /srv/docker/scripts/update.sh
 
 # Type=oneshot is subject to the start timeout, which defaults to 90s.
 # update.sh rebuilds caddy from source (xcaddy, minutes) and pulls every

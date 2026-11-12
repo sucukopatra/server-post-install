@@ -212,8 +212,8 @@ LOCK_FILE=/run/bmo-backup.lock
 if [[ $MODE != list ]] && ! (( DRY_RUN )); then
   exec {LOCK_FD}>"$LOCK_FILE"
   if ! flock -n "$LOCK_FD"; then
-    die "a backup is running (holds $LOCK_FILE) -- wait for it to finish, or
-  stop it with 'systemctl stop bmo-backup.service', then re-run this"
+    die "a backup or image update is running (holds $LOCK_FILE) -- wait for it
+  to finish, or stop a backup with 'systemctl stop bmo-backup.service', then re-run this"
   fi
 fi
 
@@ -236,6 +236,7 @@ declare -A SVC_CONTAINERS=(
   [romm]="romm romm-db"
   [minecraft]="minecraft-server"
   [gluetun]="qbittorrent gluetun"
+  [caddy]="caddy schedule"
 )
 
 # Paths under $DATA that belong to a service. minecraft has no $CONFIG half,

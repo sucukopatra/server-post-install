@@ -72,13 +72,6 @@ ${CONFIG}/caddy/webpages/schedule/app
 ${CONFIG}/caddy/webpages/schedule/data
 ${CONFIG}/caddy/webpages/schedule/tools
 ${CONFIG}/cross-seed
-# kavita has no stack at all. Its directory is kept on purpose, so the
-# state is already in place when it is switched on.
-#
-# What that costs: an empty directory still goes into every snapshot, and
-# `bmo-restore --all` enumerates services from the snapshot's $CONFIG
-# children -- so it shows up as a service of its own. That is an empty
-# step, not a wrong restore.
 # Docker created these as root:root before this file covered them, and
 # gluetun runs as root (NET_ADMIN for the wireguard interface) so it has
 # no reason to change them. Confirmed 0:0 on bmo.
@@ -90,7 +83,6 @@ ${CONFIG}/immich
 ${CONFIG}/immich/database  -
 ${CONFIG}/jellyfin
 ${CONFIG}/jellyfin/cache
-${CONFIG}/kavita
 ${CONFIG}/lidarr
 ${CONFIG}/navidrome
 ${CONFIG}/prowlarr
@@ -150,11 +142,3 @@ NAS:${NAS}/media/games
 NAS:${NAS}/media/movies
 NAS:${NAS}/media/music
 NAS:${NAS}/media/tv
-# stacks/matrix.yml, which compose.yml does not include -- kept for the
-# same reason as the $CONFIG entries above, and here it is load-bearing
-# rather than merely tidy: synapse binds this path with
-# create_host_path: false, so without it the stack fails to start on a
-# perfectly healthy NAS with "bind source path does not exist", which
-# reads as an outage rather than a missing directory. Costs nothing in
-# the backup either way -- $NAS is not backed up.
-NAS:${NAS}/matrix/media

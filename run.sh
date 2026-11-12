@@ -162,32 +162,13 @@ step "Preflight"
 [[ $EUID -ne 0 ]] || die "run as your normal user, not root -- the script calls sudo where needed"
 sudo -v || die "sudo access is required"
 
-# The Docker and Tailscale apt repositories publish for debian, ubuntu and
-# raspbian only, so derive the archive from $ID (or a derivative's $ID_LIKE)
-# and fail here rather than inside `apt-get update`.
 [[ -r /etc/os-release ]] || die "cannot read /etc/os-release -- unsupported system"
 . /etc/os-release
-
-APT_DISTRO=""
-for cand in "${ID:-}" ${ID_LIKE:-}; do
-  case $cand in
-    debian|ubuntu|raspbian) APT_DISTRO=$cand; break ;;
-  esac
-done
-[[ -n $APT_DISTRO ]] \
-  || die "this is ${ID:-unknown}, which is neither Debian, Ubuntu nor Raspbian (nor derived from one) -- the Docker and Tailscale repositories below have nothing to offer it"
-
-# UBUNTU_CODENAME first: a derivative's own VERSION_CODENAME is its own
-# invention (Mint ships "wilma") and names no suite either archive publishes.
-APT_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
-[[ -n $APT_CODENAME ]] \
-  || die "no VERSION_CODENAME in /etc/os-release -- cannot name an apt suite for this release"
-
-if [[ ${ID:-} == "$APT_DISTRO" ]]; then
-  ok "${PRETTY_NAME:-$ID} (apt suite: $APT_DISTRO $APT_CODENAME)"
-else
-  warn "${PRETTY_NAME:-${ID:-unknown}} is not directly packaged for; using its base, $APT_DISTRO $APT_CODENAME"
-fi
+[[ ${ID:-} == debian && -n ${VERSION_CODENAME:-} ]] \
+  || die "this is ${PRETTY_NAME:-${ID:-unknown}} -- run.sh supports Debian only"
+APT_DISTRO=debian
+APT_CODENAME=$VERSION_CODENAME
+ok "${PRETTY_NAME:-$ID} (apt suite: $APT_DISTRO $APT_CODENAME)"
 
 # config/site.env is per-host and gitignored; a committed site.env.<hostname>
 # is that host's own profile, so a reinstalled machine recovers settings that
@@ -779,13 +760,6 @@ sudo rsync -a --delete --chown="$PUID:$PGID" \
   "$REPO_DIR/compose/stacks/" "$DOCKER_ROOT/stacks/"
 ok "compose files synced to $DOCKER_ROOT (stacks/ pruned of removals)"
 
-# stacks/.env is removed: compose reads the project-level .env, and a copy
-# here is a second path to every secret.
-if sudo test -e "$DOCKER_ROOT/stacks/.env" || sudo test -L "$DOCKER_ROOT/stacks/.env"; then
-  sudo rm -f "$DOCKER_ROOT/stacks/.env"
-  ok "removed the obsolete stacks/.env (compose reads $ENV_TARGET directly)"
-fi
-
 # Site addresses from a Caddyfile: the lines opening a block in column 0.
 # The global options block is a bare '{' and a site block's contents are
 # indented, so neither can match. Comma-separated addresses are split out.
@@ -874,8 +848,7 @@ if sudo test -f "$ENV_TARGET"; then
       warn "compose.yml includes stacks/$f, which does not exist"
       continue
     fi
-    # Commented-out YAML is skipped first: network.yml's disabled
-    # cloudflared service needs no ${CLOUDFLARE_TUNNEL_TOKEN}.
+    # Commented-out YAML is skipped first.
     # tr strips the literal characters '$', '{' and '}'.
     # shellcheck disable=SC2016
     mapfile -t -O "${#env_required[@]}" env_required < <(
@@ -1071,13 +1044,14 @@ core_subnet=$(sudo docker network inspect -f \
   | tr ' ' '\n' | grep -m1 -E '^[0-9.]+/[0-9]+$' || true)
 
 if [[ $core_subnet =~ ^[0-9.]+/[0-9]+$ ]]; then
-  # Sweep 8384 rules whose source is not core's current subnet. `show added`,
-  # not `status`: an inactive firewall lists no rules in `status`.
-  while read -r stale; do
+  # Sweep 8384 and 53 rules from Docker ranges other than core's current
+  # subnet. `show added`, not `status`: an inactive firewall lists no rules
+  # in `status`.
+  while read -r stale port proto; do
     [[ $stale == "$core_subnet" ]] && continue
-    sudo ufw delete allow from "$stale" to any port 8384 proto tcp >/dev/null 2>&1 || true
+    sudo ufw delete allow from "$stale" to any port "$port" ${proto:+proto "$proto"} >/dev/null 2>&1 || true
   done < <(sudo ufw show added 2>/dev/null \
-             | awk '$3 == "from" && /port 8384 proto tcp/ { print $4 }' || true)
+             | awk '$3 == "from" && $4 ~ /^172\./ && $7 == "port" && ($8 == 8384 || $8 == 53) { print $4, $8, $10 }' || true)
 
   sudo ufw allow from "$core_subnet" to any port 8384 proto tcp >/dev/null
   ok "syncthing GUI restricted to the core network ($core_subnet)"

@@ -4,11 +4,6 @@ Provisions a Debian host into the bmo server: packages, Docker, directories,
 sops-encrypted secrets, compose stacks, NFS, systemd units, firewall, restic
 backups. Every step is idempotent — re-running is how you apply changes.
 
-Debian is what it is built and run on. Ubuntu and Raspberry Pi OS work too —
-the apt archive and suite are derived from `/etc/os-release`, and a derivative
-resolves to the base it names in `ID_LIKE`. Anything further afield stops at
-preflight rather than failing later inside `apt-get update`.
-
 ## Use
 
 ```sh

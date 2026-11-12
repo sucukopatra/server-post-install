@@ -6,7 +6,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # shellcheck source=/dev/null
-source <(sed -n '/^\(decompress\|verify_dumps\|valid_[a-z]*_dump\)() {/,/^}/p' "$src")
+source <(sed -n '/^\(decompress\|verify_dumps\|exclude_sql_dirs\|valid_[a-z]*_dump\)() {/,/^}/p' "$src")
 
 log()  { :; }
 warn() { WARNS+=("$*"); }
@@ -73,5 +73,36 @@ check "corrupt Immich archive fails without aborting" 1 0
 
 setup
 RESTIC_DOWN=1 check "unreachable repository warns, no stamp" 0 0
+
+have_docker() { :; }
+running() { [[ $1 == "${RUNNING:-}" ]]; }
+DUMP_STALE_HOURS=48
+declare -A SQL_LIVE_DIR=([pg]=$CONFIG/pg-live)
+
+check_excl() {
+  local name=$1 want_excluded=$2 want_fails=$3 got=0
+  FAILURES=() EXCLUDES=$work/excludes
+  : > "$EXCLUDES"
+  exclude_sql_dirs
+  grep -qxF "$CONFIG/pg-live" "$EXCLUDES" && got=1
+  if (( got == want_excluded && ${#FAILURES[@]} == want_fails )); then
+    echo "ok   $name"
+  else
+    echo "FAIL $name: excluded=$got, ${#FAILURES[@]} failure(s)"
+    rc=1
+  fi
+}
+
+setup; mkdir "$CONFIG/pg-live"
+RUNNING=pg check_excl "fresh dump excludes the live directory" 1 0
+
+setup; mkdir "$CONFIG/pg-live"; touch -d '-3 days' "$DUMP_DIR/pg.sql"
+RUNNING=pg check_excl "stale dump still excludes, and fails" 1 1
+
+setup; mkdir "$CONFIG/pg-live"; rm "$DUMP_DIR/pg.sql"
+RUNNING=pg check_excl "running engine without a dump stays in, and fails" 0 1
+
+setup; mkdir "$CONFIG/pg-live"; rm "$DUMP_DIR/pg.sql"
+check_excl "stopped engine without a dump stays in" 0 0
 
 exit $rc
