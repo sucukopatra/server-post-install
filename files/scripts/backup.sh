@@ -764,7 +764,7 @@ verify_dumps() {
                 | tail -c 200 )
     rc=$(<"$rcf")
 
-    if (( rc != 0 )) && grep -q 'not found' "$errf"; then
+    if (( rc != 0 )) && grep -q 'not found in snapshot' "$errf"; then
       fail "$c.sql is on disk but missing from the latest snapshot -- the live database directory was excluded in its favour, so that database is in no copy at all"
       bad=$(( bad + 1 ))
     elif (( rc != 0 )); then
@@ -792,7 +792,7 @@ verify_dumps() {
                 | tail -c 200 )
     rc=$(<"$rcf") gz=$(<"$gzf")
 
-    if (( rc != 0 )) && grep -q 'not found' "$errf"; then
+    if (( rc != 0 )) && grep -q 'not found in snapshot' "$errf"; then
       fail "$(basename "$imm") is on disk but missing from the latest snapshot -- this is Immich's restore path"
       bad=$(( bad + 1 ))
     elif (( rc != 0 )); then
