@@ -12,12 +12,13 @@
 include:
   - stacks/downloads.yml
 #  - stacks/info.yml
-  - stacks/music.yml
+# - stacks/music.yml
   - stacks/network.yml
   - stacks/photos.yml
   - stacks/sync.yml
   - stacks/video.yml
-  - stacks/games.yml
+  - stacks/schedule.yml
+#  - stacks/games.yml
   - stacks/minecraft.yml
 
 networks:

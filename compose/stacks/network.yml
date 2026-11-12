@@ -13,6 +13,7 @@ services:
     - ${CONFIG}/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
     - ${CONFIG}/caddy/data:/data
     - ${CONFIG}/caddy/config:/config
+    - ${CONFIG}/caddy/webpages:/webpages
     environment:
     - CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}
     networks:
@@ -30,10 +31,10 @@ services:
     - no-new-privileges:true
     environment:
     - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-    - DOMAINS=${DOMAIN}, photos.${DOMAIN}, pass.${DOMAIN}, watch.${DOMAIN}, games.${DOMAIN}, status.${DOMAIN}, discover.${DOMAIN}, listen.${DOMAIN}, findmusic.${DOMAIN}, invite.${DOMAIN}, dav.${DOMAIN}, view.${DOMAIN}, sync.${DOMAIN}
-    - PROXIED=true
+    - DOMAINS=${DOMAIN}, photos.${DOMAIN}, pass.${DOMAIN}, watch.${DOMAIN}, games.${DOMAIN}, status.${DOMAIN}, discover.${DOMAIN}, listen.${DOMAIN}, findmusic.${DOMAIN}, invite.${DOMAIN}, dav.${DOMAIN}, sync.${DOMAIN}, liva.${DOMAIN}, mc.${DOMAIN}
+    - PROXIED=!is(mc.${DOMAIN})
     - IP4_PROVIDER=none
-    - IP6_PROVIDER=cloudflare.trace 
+    - IP6_PROVIDER=cloudflare.trace
   # Parked, not dead: uncomment to enable. Indented to sit under
   # services:, so that is all it takes -- at column 0 it uncommented into
   # a top-level key and compose rejected the file.

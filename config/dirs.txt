@@ -67,6 +67,10 @@ ${CONFIG}/bazarr
 ${CONFIG}/caddy
 ${CONFIG}/caddy/config
 ${CONFIG}/caddy/data
+${CONFIG}/caddy/webpages
+${CONFIG}/caddy/webpages/schedule/app
+${CONFIG}/caddy/webpages/schedule/data
+${CONFIG}/caddy/webpages/schedule/tools
 ${CONFIG}/cross-seed
 # glance and uptime-kuma below belong to stacks/info.yml, which
 # compose.yml does not include; kavita has no stack at all. The three

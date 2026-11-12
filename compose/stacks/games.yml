@@ -41,7 +41,7 @@ services:
       - core
 
   romm-db:
-    image: mariadb:latest
+    image: mariadb:11.8
     container_name: romm-db
     environment:
       - TZ=${TZ}

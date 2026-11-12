@@ -1,0 +1,36 @@
+# Weekly timetable + sync API. Add to your compose includes like the other stacks.
+services:
+  schedule:
+    image: python:3.12-alpine
+    container_name: schedule
+    restart: unless-stopped
+    user: "1000:1000"
+    command: ["python", "-u", "/app/server.py"]
+    environment:
+      - DATA_DIR=/data
+      - PORT=8080
+      # Log timestamps only -- the page reads times from the browser and the
+      # .ics carries floating times, so nothing user-facing depends on this.
+      - TZ=${TZ}
+      # For tools/push-dav.py, which the laptop runs here with docker exec at
+      # deploy time -- this container is already on core, so it can reach
+      # radicale:5232, which the host cannot (sync.yml exposes, never
+      # publishes). Nothing in this block may be quoted; see sync.yml.
+      - SCHEDULE_DAV_USER=${SCHEDULE_DAV_USER}
+      - SCHEDULE_DAV_PASS=${SCHEDULE_DAV_PASS}
+    volumes:
+      - ${CONFIG}/caddy/webpages/schedule/app:/app:ro
+      - ${CONFIG}/caddy/webpages/schedule/data:/data
+      # Outside WEB_DIR (/app/web), so none of it is reachable over HTTP.
+      - ${CONFIG}/caddy/webpages/schedule/tools:/tools:ro
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 1m
+      timeout: 5s
+      retries: 3
+
+networks:
+  core:
+    external: true

@@ -51,7 +51,6 @@ services:
     depends_on:
     - sonarr
     - radarr
-    - lidarr
     networks:
     - core
   autobrr:

@@ -7,7 +7,6 @@ services:
     stdin_open: true
     ports:
       - "25565:25565"
-      - "8100:8100"
     environment:
       EULA: "TRUE"
       TYPE: "FABRIC"
@@ -21,29 +20,14 @@ services:
         sucukopatra
       EXISTING_OPS_FILE: "SYNCHRONIZE"
       MODRINTH_PROJECTS: |-
-        lithium
-        krypton
-        ferrite-core
-        c2me-fabric
-        chunky
-        debugify
-        modernfix?
-        bluemap?
-        alternate-current
-        noisiumforked
-        spark
-        terralith
-        remove-terralith-intro-message
-        tectonic
-        sparsestructures
-        dungeons-and-taverns
-        explorify
-        improved-village-placement
-        structory
-        nullscape
-        amplified-nether
-        vanilla-refresh?
-      MODRINTH_DOWNLOAD_DEPENDENCIES: "none"
+        fabric-api
+        skinrestorer?
+        lithium?
+        ferrite-core?
+        alternate-current?
+        chunky?
+        spark?
+      MODRINTH_DOWNLOAD_DEPENDENCIES: "required"
       MODRINTH_ALLOWED_VERSION_TYPE: "alpha"
       ANNOUNCE_PLAYER_ACHIEVEMENTS: "true"
     volumes:
