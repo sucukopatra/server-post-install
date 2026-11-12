@@ -7,6 +7,7 @@ set -e
 cd /srv/docker
 
 HC=$(sed -n 's/^UPDATE_HEALTHCHECK_URL=//p' .env 2>/dev/null | head -1)
+HC=${HC//[\"\']/}
 hc() { [[ -z $HC ]] || curl -fsS -m 5 --retry 2 --retry-max-time 20 -o /dev/null "${HC%/}$1" || true; }
 hc /start
 trap 'hc /$?' EXIT
@@ -36,10 +37,11 @@ if grep -qs "[[:space:]]${NAS}[[:space:]]" /etc/fstab && [[ ! -d "$NAS/media" ]]
 fi
 
 # The slow, failure-prone steps run while the stack is still up.
+rc=0
 echo "==> Rebuilding locally-built images (caddy)..."
-docker compose build --pull caddy
+docker compose build --pull caddy || rc=$?
 echo "==> Pulling latest images..."
-docker compose pull --ignore-buildable
+docker compose pull --ignore-buildable || rc=$?
 
 echo "==> Recreating changed containers..."
 docker compose up -d --remove-orphans
@@ -47,3 +49,4 @@ docker compose up -d --remove-orphans
 echo "==> Removing unused images..."
 docker image prune -f
 echo "==> Done."
+exit "$rc"

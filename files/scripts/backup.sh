@@ -303,6 +303,7 @@ dump_mariadb() {
 SQLITE_DUMPED=()
 
 dump_sqlite() {
+  rm -rf "$DUMP_DIR/sqlite"
   if ! command -v sqlite3 >/dev/null; then
     fail "sqlite3 not installed -- SQLite databases copied as live files, may restore torn"
     return 0

@@ -117,7 +117,7 @@ trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 # Ctrl-C is the ordinary way out of the secret prompts below, and without
 # this it strands 0600 secrets in /tmp and a live `mount --bind /` from
-# harden_data_mountpoint, one per interrupted run.
+# harden_mountpoint, one per interrupted run.
 CLEANUP_PATHS=()
 CLEANUP_MOUNT=""
 
@@ -462,56 +462,52 @@ else
 fi
 
 # dockerd starts every `restart: unless-stopped` container at boot whether or
-# not the data disk arrived, so the immutable bit goes on the *bare*
+# not the data disk or NAS arrived, so the immutable bit goes on the *bare*
 # mountpoint underneath the mount: inert while the disk is there, EPERM on
 # every write when it is not. chattr rather than chmod because Docker creates
 # missing bind-mount sources as root. Deliberately not RequiresMountsFor= on
 # docker.service, which would stop dockerd outright on a dead data disk.
-harden_data_mountpoint() {
-  if [[ ${DATA_IS_MOUNT:-1} != 1 ]]; then
-    skip "DATA_IS_MOUNT=0 -- $DATA is not a mountpoint, nothing to harden"
-    return 0
-  fi
-
+harden_mountpoint() {
+  local mnt=$1
   # Reaching the directory *under* a mount needs a non-recursive bind of /,
   # which shows the root filesystem without the mounts layered on it.
-  local view="" target=$DATA
-  if mountpoint -q "$DATA" 2>/dev/null; then
+  local view="" target=$mnt
+  if mountpoint -q "$mnt" 2>/dev/null; then
     view=$(mktemp -d)
     # Registered before the mount: an umount of a directory that was never
     # mounted fails harmlessly, while the reverse loses the mount.
     CLEANUP_MOUNT=$view
     sudo mount --bind / "$view"
-    target="$view$DATA"
-    # $DATA under some *other* mount is not visible through a bind of / at
+    target="$view$mnt"
+    # $mnt under some *other* mount is not visible through a bind of / at
     # all, so bail rather than mkdir an immutable directory nobody asked for.
     if ! sudo test -d "$target"; then
       sudo umount "$view"; rmdir "$view"; CLEANUP_MOUNT=""
-      warn "cannot reach the bare $DATA through a bind of / -- mountpoint left unhardened"
+      warn "cannot reach the bare $mnt through a bind of / -- mountpoint left unhardened"
       return 0
     fi
   fi
 
   if sudo lsattr -d "$target" 2>/dev/null | awk '{print $1}' | grep -q i; then
-    skip "$DATA mountpoint is already immutable"
+    skip "$mnt mountpoint is already immutable"
   elif [[ -n $(sudo find "$target" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) ]]; then
     # Contents here are the failure this prevents, already happened, and
     # freezing them in place with +i would only make them harder to clear.
-    warn "the bare $DATA mountpoint is not empty -- files were written while the disk was unmounted"
+    warn "the bare $mnt mountpoint is not empty -- files were written while nothing was mounted there"
     if [[ -n $view ]]; then
       warn "they are hidden by the mount and consuming the root filesystem. To inspect and clear:"
       warn "  sudo mkdir -p /mnt/rootfs && sudo mount --bind / /mnt/rootfs"
-      warn "  sudo du -sh /mnt/rootfs$DATA && sudo rm -rf /mnt/rootfs$DATA/*"
+      warn "  sudo du -sh /mnt/rootfs$mnt && sudo rm -rf /mnt/rootfs$mnt/*"
       warn "  sudo umount /mnt/rootfs"
     else
-      warn "the disk is not mounted right now, so they are in plain sight. To inspect and clear:"
-      warn "  sudo du -sh $DATA && sudo rm -rf $DATA/*"
+      warn "nothing is mounted there right now, so they are in plain sight. To inspect and clear:"
+      warn "  sudo du -sh $mnt && sudo rm -rf $mnt/*"
     fi
     warn "then re-run to set the immutable bit"
   elif sudo chattr +i "$target" 2>/dev/null; then
-    ok "$DATA mountpoint made immutable -- writes fail if the disk is missing"
+    ok "$mnt mountpoint made immutable -- writes fail if nothing is mounted there"
   else
-    warn "could not set the immutable bit on the $DATA mountpoint (filesystem may not support it)"
+    warn "could not set the immutable bit on the $mnt mountpoint (filesystem may not support it)"
   fi
 
   if [[ -n $view ]]; then
@@ -521,7 +517,11 @@ harden_data_mountpoint() {
   fi
 }
 
-harden_data_mountpoint
+if [[ ${DATA_IS_MOUNT:-1} == 1 ]]; then
+  harden_mountpoint "$DATA"
+else
+  skip "DATA_IS_MOUNT=0 -- $DATA is not a mountpoint, nothing to harden"
+fi
 
 step "Secrets"
 
@@ -754,65 +754,17 @@ sudo rsync -a --chown="$PUID:$PGID" \
   "$REPO_DIR/compose/" "$DOCKER_ROOT/"
 
 # --delete over stacks/ only, so a stack removed from the repo stops being
-# deployed; $DOCKER_ROOT also holds scripts/ and the Caddyfile link.
+# deployed; $DOCKER_ROOT also holds scripts/.
 sudo rsync -a --delete --chown="$PUID:$PGID" \
   --exclude '.env' \
   "$REPO_DIR/compose/stacks/" "$DOCKER_ROOT/stacks/"
 ok "compose files synced to $DOCKER_ROOT (stacks/ pruned of removals)"
 
-# Site addresses from a Caddyfile: the lines opening a block in column 0.
-# The global options block is a bare '{' and a site block's contents are
-# indented, so neither can match. Comma-separated addresses are split out.
-caddy_site_addresses() {
-  sudo sed -nE 's/^([A-Za-z0-9_*.,-][A-Za-z0-9_*.,[:space:]-]*)\{[[:space:]]*$/\1/p' "$1" \
-    | tr ',' '\n' \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-    | grep -E '\.' \
-    | sort -u
-}
-
 CADDYFILE="$CONFIG/caddy/Caddyfile"
 
-# Read by the Verification summary. A Caddyfile this script renders itself
-# matches $DOMAIN by construction, so 1 is the right starting value.
-CADDY_DOMAIN_OK=1
-
-# Does the Caddyfile on disk serve $DOMAIN? Asked again after a restore,
-# which brings back the snapshot's copy. $1 says where the file came from.
-check_caddy_domain() {
-  local origin=$1 addr
-  local -a addrs=() stale=()
-  [[ -f $CADDYFILE ]] || return 0
-
-  # Matched by suffix rather than by stripping the leftmost label, so an
-  # apex block is not reported as the domain "com".
-  mapfile -t addrs < <(caddy_site_addresses "$CADDYFILE")
-  for addr in "${addrs[@]}"; do
-    [[ $addr == "$DOMAIN" || $addr == *".$DOMAIN" ]] || stale+=("$addr")
-  done
-
-  if (( ${#stale[@]} )); then
-    CADDY_DOMAIN_OK=0
-    warn "$CADDYFILE serves ${#stale[@]} address(es) that are not under DOMAIN=$DOMAIN:"
-    printf '    %s\n' "${stale[@]:0:6}"
-    (( ${#stale[@]} > 6 )) && printf '    ... and %d more\n' "$(( ${#stale[@]} - 6 ))"
-    warn "$origin"
-    warn ".env, cloudflare-ddns and vaultwarden are all set to $DOMAIN, so nothing"
-    warn "agrees with this file. Edit it, or discard it and re-run to render a"
-    warn "fresh one from templates/Caddyfile.tmpl:"
-    warn "  sudo rm $CADDYFILE"
-    return 0
-  fi
-  CADDY_DOMAIN_OK=1
-  return 0
-}
-
 if [[ -f $CADDYFILE ]]; then
-  # Left alone: live, hand-edited configuration. Its domain is still checked,
-  # because changing DOMAIN moves everything else but not this file.
-  check_caddy_domain "this file was already on the host; nothing here changed it."
-  (( CADDY_DOMAIN_OK )) \
-    && skip "Caddyfile exists and matches DOMAIN=$DOMAIN -- leaving it alone"
+  # Left alone: live, hand-edited configuration.
+  skip "Caddyfile exists -- leaving it alone"
 else
   # sed_rhs for the same reason env_set uses it: an unescaped & in the
   # replacement expands to the whole match.
@@ -822,26 +774,16 @@ else
   ok "rendered Caddyfile for $DOMAIN"
 fi
 
-LINK="$DOCKER_ROOT/Caddyfile"
-# Nothing reads this link: it puts the Caddyfile in reach from $DOCKER_ROOT.
-if [[ -L $LINK || ! -e $LINK ]]; then
-  sudo ln -sfn "$CONFIG/caddy/Caddyfile" "$LINK"
-  sudo chown -h "$PUID:$PGID" "$LINK"
-  ok "linked $LINK -> $CONFIG/caddy/Caddyfile"
-else
-  warn "$LINK exists and is a real file, not a symlink -- left alone"
-fi
-
-# compose turns an unset variable into an empty string and carries on, so
-# `${CONFIG}/x` becomes `/x`. Only included stacks, and only a bare `${VAR}`:
-# `${VAR:-default}` supplies its own value.
+# compose turns an unset variable into an empty string and carries on. Only
+# included stacks, and only a bare `${VAR}`: `${VAR:-default}` supplies its
+# own value.
 if sudo test -f "$ENV_TARGET"; then
   mapfile -t included < <(
     sed -n '/^include:/,/^[^[:space:]#-]/p' "$REPO_DIR/compose/compose.yml" \
       | sed -n 's|^[[:space:]]*-[[:space:]]*stacks/\([A-Za-z0-9._-]*\.yml\).*|\1|p'
   )
 
-  env_required=(); declare -A env_paths=()
+  env_required=()
   for f in "${included[@]}"; do
     src="$REPO_DIR/compose/stacks/$f"
     if [[ ! -f $src ]]; then
@@ -854,15 +796,6 @@ if sudo test -f "$ENV_TARGET"; then
     mapfile -t -O "${#env_required[@]}" env_required < <(
       grep -vE '^[[:space:]]*#' "$src" \
         | grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' | tr -d '${}')
-    # A variable that opens a bind-mount source. Empty, it does not
-    # misconfigure a container -- it relocates the mount to /.
-    # shellcheck disable=SC2016
-    while IFS= read -r v; do
-      [[ -n $v ]] && env_paths[$v]=1
-    done < <(
-      grep -vE '^[[:space:]]*#' "$src" \
-        | grep -oE '^[[:space:]]*-[[:space:]]*"?\$\{[A-Z_][A-Z0-9_]*\}[^":]*:' \
-        | grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' | tr -d '${}')
   done
 
   # `=.+` so a key present but blank counts as missing, which is exactly
@@ -872,23 +805,12 @@ if sudo test -f "$ENV_TARGET"; then
     [[ -n $v ]] && env_present[$v]=1
   done < <(sudo grep -oE '^[A-Z_][A-Z0-9_]*=.+' "$ENV_TARGET" | cut -d= -f1)
 
-  env_missing=(); env_missing_paths=(); env_checked=0
+  env_missing=(); env_checked=0
   while IFS= read -r v; do
     [[ -n $v ]] || continue
     (( ++env_checked ))
-    [[ -n ${env_present[$v]:-} ]] && continue
-    if [[ -n ${env_paths[$v]:-} ]]; then
-      env_missing_paths+=("$v")
-    else
-      env_missing+=("$v")
-    fi
+    [[ -n ${env_present[$v]:-} ]] || env_missing+=("$v")
   done < <(printf '%s\n' "${env_required[@]}" | sort -u)
-
-  if (( ${#env_missing_paths[@]} )); then
-    warn "these open a bind-mount source and are empty or absent in $ENV_TARGET:"
-    printf '    %s\n' "${env_missing_paths[@]}"
-    die "compose would mount those at the root of the filesystem -- refusing to continue"
-  fi
 
   if (( ${#env_missing[@]} )); then
     warn "${#env_missing[@]} variable(s) the enabled stacks reference are empty or absent in $ENV_TARGET:"
@@ -926,6 +848,19 @@ EOF
 fi
 
 step "NFS mount"
+
+# interface name can change across reinstalls, so discover it
+LAN_IF=$(ip -o -4 route show default | awk '{print $5}' | head -1)
+LAN_GW=$(ip -o -4 route show default | awk '{print $3}' | head -1)
+
+if [[ $LAN_GW =~ ^[0-9.]+$ ]] && systemctl cat ifupdown-wait-online.service >/dev/null 2>&1; then
+  if ! grep -qsxF "WAIT_ONLINE_ADDRESS=$LAN_GW" /etc/default/networking; then
+    printf 'WAIT_ONLINE_METHOD=ping\nWAIT_ONLINE_ADDRESS=%s\n' "$LAN_GW" \
+      | sudo tee -a /etc/default/networking >/dev/null
+  fi
+  sudo systemctl enable ifupdown-wait-online.service >/dev/null 2>&1
+  ok "network-online.target waits until the gateway $LAN_GW answers (the NAS mount needs IPv4)"
+fi
 
 FSTAB_LINE="${NAS_HOST}:${NAS_EXPORT}  ${NAS}  nfs  rw,_netdev,x-systemd.automount,x-systemd.requires=network-online.target,noatime,nofail  0  0"
 
@@ -973,12 +908,14 @@ else
   warn "$NAS did not respond within 30s -- check the NAS is up"
 fi
 
+harden_mountpoint "$NAS"
+
 # Only safe now the export is mounted: created earlier they land on the
 # root filesystem, and the mount then hides them.
-if mountpoint -q "$NAS" 2>/dev/null; then
+if findmnt -rn -t nfs,nfs4 -M "$NAS" >/dev/null 2>&1; then
   create_dirs nas
 else
-  warn "$NAS is not a mount point -- NAS directories not created"
+  warn "the NAS export is not mounted at $NAS -- NAS directories not created"
   warn "mount the export and re-run; creating them now would fill the root disk"
 fi
 
@@ -1065,8 +1002,6 @@ else
   warn "  sudo ufw allow from \$(sudo docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' core | tr ' ' '\\n' | grep -m1 -E '^[0-9.]+/[0-9]+$') to any port 8384 proto tcp"
 fi
 
-# interface name can change across reinstalls, so discover it
-LAN_IF=$(ip -o -4 route show default | awk '{print $5}' | head -1)
 if [[ -n $LAN_IF ]]; then
   sudo ufw allow in on "$LAN_IF" to any port 21027 proto udp >/dev/null  # syncthing discovery
   ok "base rules applied (LAN interface: $LAN_IF)"
@@ -1352,26 +1287,17 @@ else
     sudo /usr/local/sbin/bmo-restore --all \
       || die "restore failed -- do NOT start the stack; investigate, then: sudo /usr/local/sbin/bmo-restore --all"
     ok "restore finished -- review the output above before starting the stack"
-
-    # The restore has just replaced $CONFIG/caddy with the snapshot's
-    # copy, which carries whatever domain the host had when it was backed
-    # up -- so the earlier check is now about a file that no longer
-    # exists. Silent when it passes; the Verification summary reports it.
-    check_caddy_domain "that file came from the snapshot, and carries the domain this host had when it was backed up."
   fi
 fi
 
 step "Verification"
 
-printf '  %-22s %s\n' "NAS mounted:"   "$(mountpoint -q "$NAS" && echo yes || echo NO)"
+printf '  %-22s %s\n' "NAS mounted:"   "$(findmnt -rn -t nfs,nfs4 -M "$NAS" >/dev/null 2>&1 && echo yes || echo NO)"
 printf '  %-22s %s\n' "data disk:"     "$(mountpoint -q "$DATA" && echo yes || echo 'NO (check UUID in fstab)')"
 # `|| true`: systemctl is-active exits 3 for inactive, after printing it.
 printf '  %-22s %s\n' "docker:"        "$(systemctl is-active docker || true)"
 printf '  %-22s %s\n' "core network:"  "$(sudo docker network inspect core >/dev/null 2>&1 && echo yes || echo NO)"
 printf '  %-22s %s\n' ".env:"          "$([[ -s $ENV_TARGET ]] && echo present || echo MISSING)"
-# Deliberately repeats the warning above rather than restating it: a restore
-# run buries that one, and this is the screen written to be read last.
-printf '  %-22s %s\n' "caddy domain:"  "$( (( CADDY_DOMAIN_OK )) && echo "matches $DOMAIN" || echo "STALE -- Caddy will serve the wrong name")"
 printf '  %-22s %s\n' "ufw:"           "$(sudo ufw status | head -1 | awk '{print $2}')"
 printf '  %-22s %s\n' "backup timer:"  "$(systemctl is-enabled bmo-backup.timer 2>/dev/null || echo 'not installed')"
 # The timer being enabled says nothing about whether it can reach the

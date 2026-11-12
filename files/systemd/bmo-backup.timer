@@ -16,7 +16,7 @@ OnCalendar=*-*-* 03:30:00
 Persistent=true
 
 # Keeps a catch-up run at boot from landing on top of docker-update.service
-# pulling every image at once. Irrelevant for the normal 03:30 firing.
+# pulling every image at once.
 RandomizedDelaySec=15m
 
 [Install]

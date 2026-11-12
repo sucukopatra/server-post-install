@@ -673,25 +673,23 @@ for svc in "${sql_pending[@]}"; do
       fi
 
       # Immich's own scheduled dump handles the vectorchord extension; it is the
-      # one to restore from. `|| true`: find exits 1 on a missing directory.
+      # one to restore from.
       backup_dir="$DATA/photos/backups"
-      newest=$(find "$backup_dir" -type f \( -name '*.sql' -o -name '*.sql.gz' \) \
-                 -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)
+      newest=$(restic ls "$SNAP" "$backup_dir" 2>/dev/null \
+                 | grep -E '/immich-db-backup-[^/]*\.sql(\.gz)?$' | sort | tail -1 || true)
       if [[ -z $newest ]]; then
-        if [[ -d $backup_dir ]]; then
-          warn "no Immich self-dump under $backup_dir"
-        else
-          warn "$backup_dir does not exist"
-          warn "\$DATA/photos was not restored -- either it was declined at the prompt"
-          warn "above, or this is a fresh disk. Re-run 'bmo-restore immich' and accept"
-          warn "the \$DATA restore, then this dump will be there to load."
-        fi
+        warn "no Immich self-dump under $backup_dir in snapshot $SNAP"
         warn "the fallback is _dumps/immich_postgres.sql from the same snapshot,"
         warn "but it does not carry Immich's extension handling. Load it by hand"
         warn "only if you understand what that means for the vectorchord index."
         continue
       fi
-      ok "newest Immich dump: $(basename "$newest") ($(date -d "@$(stat -c %Y "$newest")" +%F))"
+      if ! run restic restore "$SNAP" --target "$STAGE" --include "$newest" >/dev/null 2>&1; then
+        warn "restic could not restore $newest from $SNAP -- Immich database left empty"
+        continue
+      fi
+      dump_file="$STAGE$newest"
+      ok "newest Immich dump in $SNAP: $(basename "$newest")"
 
       run docker compose -f "$DOCKER_ROOT/compose.yml" up -d database >/dev/null 2>&1 \
         || warn "could not start the database container automatically"
@@ -718,7 +716,7 @@ for svc in "${sql_pending[@]}"; do
       else
         # The header, read once into a variable. `head` on a live pipe kills gunzip
         # with SIGPIPE, which pipefail turns into a failed test.
-        dump_head=$(dump_stream "$newest" 2>/dev/null | head -200 || true)
+        dump_head=$(dump_stream "$dump_file" 2>/dev/null | head -200 || true)
         dump_major=$(pg_major <<<"$dump_head" || true)
         live_ver_raw=$(docker exec immich_postgres postgres --version 2>/dev/null || true)
         live_major=$(grep -oE '[0-9]+' <<<"$live_ver_raw" | head -1 || true)
@@ -785,7 +783,7 @@ for svc in "${sql_pending[@]}"; do
         PSQL_ERR=$(mktemp)
         psql_rc=0
         # shellcheck disable=SC2016
-        dump_stream "$newest" \
+        dump_stream "$dump_file" \
           | docker exec -i immich_postgres sh -c \
               'if [ "$1" = 1 ]; then
                  exec psql -U "$POSTGRES_USER" -d postgres

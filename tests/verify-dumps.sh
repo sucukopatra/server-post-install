@@ -6,7 +6,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # shellcheck source=/dev/null
-source <(sed -n '/^\(decompress\|verify_dumps\|exclude_sql_dirs\|valid_[a-z]*_dump\)() {/,/^}/p' "$src")
+source <(sed -n '/^\(decompress\|verify_dumps\|exclude_sql_dirs\|dump_sqlite\|valid_[a-z]*_dump\)() {/,/^}/p' "$src")
 
 log()  { :; }
 warn() { WARNS+=("$*"); }
@@ -104,5 +104,17 @@ RUNNING=pg check_excl "running engine without a dump stays in, and fails" 0 1
 
 setup; mkdir "$CONFIG/pg-live"; rm "$DUMP_DIR/pg.sql"
 check_excl "stopped engine without a dump stays in" 0 0
+
+setup; mkdir -p "$CONFIG/app" "$DUMP_DIR/sqlite/gone"
+sqlite3 "$CONFIG/app/live.db" 'CREATE TABLE t(x)'
+: > "$DUMP_DIR/sqlite/gone/old.db"
+FAILURES=() SQLITE_DUMPED=()
+dump_sqlite
+if [[ -s $DUMP_DIR/sqlite/app/live.db && ! -e $DUMP_DIR/sqlite/gone/old.db ]] && (( ${#FAILURES[@]} == 0 )); then
+  echo "ok   SQLite dump not rewritten tonight is gone, live one dumped"
+else
+  echo "FAIL SQLite dumps: live dumped=$([[ -s $DUMP_DIR/sqlite/app/live.db ]] && echo y || echo n), stale left=$([[ -e $DUMP_DIR/sqlite/gone/old.db ]] && echo y || echo n), ${#FAILURES[@]} failure(s)"
+  rc=1
+fi
 
 exit $rc
