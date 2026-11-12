@@ -11,8 +11,8 @@
 
 include:
   - stacks/downloads.yml
-#  - stacks/info.yml
-# - stacks/music.yml
+  - stacks/info.yml
+  - stacks/music.yml
   - stacks/network.yml
   - stacks/photos.yml
   - stacks/sync.yml

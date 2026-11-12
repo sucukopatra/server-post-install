@@ -124,7 +124,8 @@ silently unmonitored. `HEALTHCHECK_URL` in `config/site.env` overrides it, for a
 host that should report somewhere else.
 
 `backup.sh` then pings on start, success and failure, and the far end alerts you
-if the success ping does not arrive.
+if the success ping does not arrive. `update.sh` does the same with
+`UPDATE_HEALTHCHECK_URL` (also in sops), on every boot and weekly timer run.
 
 This is deliberately not a systemd `OnFailure=`. That only fires when the unit
 runs and fails, and nothing running on bmo can tell you that bmo is off, that

@@ -72,16 +72,13 @@ ${CONFIG}/caddy/webpages/schedule/app
 ${CONFIG}/caddy/webpages/schedule/data
 ${CONFIG}/caddy/webpages/schedule/tools
 ${CONFIG}/cross-seed
-# glance and uptime-kuma below belong to stacks/info.yml, which
-# compose.yml does not include; kavita has no stack at all. The three
-# directories are kept on purpose, so the state is already in place when
-# they are switched on.
+# kavita has no stack at all. Its directory is kept on purpose, so the
+# state is already in place when it is switched on.
 #
 # What that costs: an empty directory still goes into every snapshot, and
 # `bmo-restore --all` enumerates services from the snapshot's $CONFIG
-# children -- so each shows up as a service of its own. That is an empty
-# step, not a wrong restore. gotify was a fourth and was dropped instead.
-${CONFIG}/glance
+# children -- so it shows up as a service of its own. That is an empty
+# step, not a wrong restore.
 # Docker created these as root:root before this file covered them, and
 # gluetun runs as root (NET_ADMIN for the wireguard interface) so it has
 # no reason to change them. Confirmed 0:0 on bmo.

@@ -7,6 +7,11 @@
 set -e
 cd /srv/docker
 
+HC=$(sed -n 's/^UPDATE_HEALTHCHECK_URL=//p' .env 2>/dev/null | head -1)
+hc() { [[ -z $HC ]] || curl -fsS -m 5 --retry 2 --retry-max-time 20 -o /dev/null "${HC%/}$1" || true; }
+hc /start
+trap 'hc /$?' EXIT
+
 # Refuse to restart the stack onto a data disk that is meant to be there
 # and is not. docker-update.service already carries RequiresMountsFor for
 # this path, so systemd covers the boot run -- this covers a hand-run,

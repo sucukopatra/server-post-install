@@ -99,7 +99,7 @@ services:
       target: /data
       bind:
         create_host_path: false
-    - ${CONFIG}/aurral:/app/backend/data
+    - ${CONFIG}/aurral:/config
     networks:
     - core
     depends_on:
