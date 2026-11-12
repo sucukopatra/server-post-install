@@ -123,24 +123,14 @@ ${CONFIG}/syncthing
 # technitium runs as root and chowns its whole /etc/dns tree to root;
 # all 0:0 on bmo, including the subdirectories it creates itself
 ${CONFIG}/technitium  -
-${CONFIG}/unpackerr
 ${CONFIG}/uptime-kuma
 ${CONFIG}/vaultwarden
 ${CONFIG}/wizarr
 
 # $DATA holds only what a container actually mounts from it: immich's
 # library, syncthing's tree, and the minecraft world. Media and downloads
-# live on the NAS.
-#
-# There used to be ${DATA}/media/{anime,books,movies,music,tv} and
-# ${DATA}/downloads/{cross-seed,music,torrents,usenet} here as well.
-# Nothing mounted them -- every *arr, qBittorrent, Jellyfin, Navidrome
-# and slskd mounts ${NAS}, so those paths were invisible from inside
-# every container. They were pre-NAS copies, and on bmo they had been
-# quietly sitting on the SSD ever since, getting swept into the backup.
-# Removed 2026-08-03. Do not add them back without a compose file that
-# mounts them: the /data/media/... paths visible in the *arr web panels
-# are the NAS, not this disk.
+# live on the NAS: the /data/media/... paths in the *arr web panels are the
+# NAS, not this disk.
 DATA:${DATA}/games/minecraft
 DATA:${DATA}/photos/backups
 DATA:${DATA}/photos/encoded-video

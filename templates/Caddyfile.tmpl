@@ -64,10 +64,7 @@ invite.{{DOMAIN}} {
 }
 
 slskd.{{DOMAIN}} {
-    reverse_proxy slskd:5030 {
-        header_up Upgrade {http.request.header.Upgrade}
-        header_up Connection "Upgrade"
-    }
+    reverse_proxy slskd:5030
 }
 
 radarr.{{DOMAIN}} {

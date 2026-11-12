@@ -1,10 +1,9 @@
-# Weekly timetable + sync API. Add to your compose includes like the other stacks.
 services:
   schedule:
     image: python:3.12-alpine
     container_name: schedule
     restart: unless-stopped
-    user: "1000:1000"
+    user: ${PUID}:${PGID}
     command: ["python", "-u", "/app/server.py"]
     environment:
       - DATA_DIR=/data
@@ -30,7 +29,3 @@ services:
       interval: 1m
       timeout: 5s
       retries: 3
-
-networks:
-  core:
-    external: true

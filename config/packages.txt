@@ -19,6 +19,7 @@ bash-completion
 ncdu
 restic
 sqlite3
+age
 
 # --- networking ---
 nfs-common

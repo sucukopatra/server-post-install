@@ -15,11 +15,7 @@
 
 set -euo pipefail
 
-# Before 4.4, "${arr[@]}" on an empty array is an "unbound variable" error
-# under `set -u`, and several arrays here are legitimately empty -- no
-# packages missing, no cleanup paths registered, no arguments to replay.
-# Stated and checked rather than worked around at each use site, where it
-# read as nine copies of an incantation with no explanation.
+# "${arr[@]}" on an empty array is an unbound-variable error before 4.4.
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
   echo "bash 4.4 or newer is required (this is $BASH_VERSION)" >&2
   exit 1
@@ -50,9 +46,7 @@ prompt_yn() {
 }
 
 usage() {
-  # Bounded by the blank line that ends the header comment, not by a line
-  # count: a count goes stale the moment the header grows a line, and the
-  # first thing to fall off the bottom is the flag documented last.
+  # Bounded by the blank line ending the header, not by a line count.
   sed -n '3,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
   exit "${1:-0}"
 }
@@ -271,13 +265,8 @@ install_templated() {
   rm -f "$tmp"
 }
 
-# Which of these package names are not installed, one name per line.
-#
-# `dpkg-query -W` takes the whole list at once, so this is one process and
-# one pass over dpkg's status database rather than a dpkg-query and a grep
-# per name -- the two callers below ask about ~35 packages between them.
-# Names dpkg has never heard of are absent from the output entirely, which
-# is the same answer as "not installed".
+# Which of these package names are not installed, one per line. One
+# dpkg-query for the whole list; unknown names count as not installed.
 missing_pkgs() {
   local p st
   local -A installed=()
@@ -334,10 +323,7 @@ step "Packages"
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$REPO_DIR/config/packages.txt")
 DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
 
-# What is missing is answered from the local dpkg database, so the index
-# refresh below is only worth its network round trips when there is
-# actually something to install -- on the steady-state re-run this script
-# advertises as the normal way to apply changes, there never is.
+# Answered from dpkg, so apt-get update runs only when something is missing.
 mapfile -t missing < <(missing_pkgs "${PKGS[@]}" "${DOCKER_PKGS[@]}")
 
 if (( ${#missing[@]} )); then
@@ -377,21 +363,13 @@ fi
 step "Directories"
 
 # Creates the dirs.txt entries whose GROUP: prefix matches $1 ("local" for
-# unprefixed lines). The groups exist because a directory created under a
-# filesystem that is not mounted yet lands on the root disk, where the
-# eventual mount hides it.
-#
+# unprefixed lines), so nothing is created before its filesystem is mounted.
 # The single quotes around ${...} below are literal match targets.
 # shellcheck disable=SC2016
 create_dirs() {
   local want=$1 line dir owner cur group created=0 wrong=0
-  # Classified in one pass and acted on in bulk below. Every `sudo` is a
-  # full policy, PAM and audit evaluation, and the per-directory form cost
-  # one for the mkdir, one for the chown and one for the stat -- roughly
-  # 230 of them across the three calls this script makes, to touch 63
-  # paths. dirs.txt lists no directory before its own parent and no path
-  # twice, so deciding what exists up front sees the same disk the
-  # incremental version did.
+  # Classified in one pass, then acted on in bulk: one sudo per action, not per
+  # directory. dirs.txt lists no directory before its parent.
   local -a to_create=() check_dirs=() group_dirs=()
   local -A want_owner=() chown_of=()
   while IFS= read -r line; do
@@ -460,10 +438,8 @@ create_dirs() {
     done
   fi
 
-  # One stat for every directory that already exists. Split on the LAST
-  # space: '%u:%g' can never contain one, but a directory name can, and
-  # `stat` emits its results in argument order so the warnings still come
-  # out in dirs.txt order.
+  # One stat for all existing directories. Split on the LAST space: a path
+  # may contain one, '%u:%g' cannot.
   if (( ${#check_dirs[@]} )); then
     while IFS= read -r line; do
       [[ -n $line ]] || continue
@@ -568,13 +544,6 @@ harden_data_mountpoint
 
 step "Secrets"
 
-if ! command -v age >/dev/null; then
-  sudo apt-get install -y age
-  ok "age installed"
-else
-  skip "age present"
-fi
-
 if ! command -v sops >/dev/null; then
   if [[ -n ${SOPS_VERSION:-} ]]; then
     sops_ver="$SOPS_VERSION"
@@ -665,12 +634,7 @@ if [[ -f $REPO_DIR/secrets/env.sops ]]; then
   while (( ++attempt <= 3 )); do
     if [[ -z $key_candidate ]]; then
       key_candidate=$(mktemp); chmod 600 "$key_candidate"; cleanup_add "$key_candidate"
-      # `|| rc=$?`, not `; rc=$?`. read_age_key returns 1 for blank and 2
-      # for a bad format, and under `set -e` a bare call dies through the
-      # ERR trap before rc is read -- which made the whole branch below
-      # unreachable, including the prompt's own offer to skip decryption.
-      # On the left of `||` it is a tested command, the one context set -e
-      # leaves alone.
+      # `|| rc=$?`: under set -e a bare call would die before rc is read.
       rc=0; read_age_key "$key_candidate" || rc=$?
       if (( rc == 2 )); then                       # bad format, offer another
         rm -f "$key_candidate"; key_candidate=""
@@ -685,10 +649,7 @@ if [[ -f $REPO_DIR/secrets/env.sops ]]; then
       promote=1
     fi
 
-    # --input-type/--output-type are required: sops infers the format from
-    # the extension, does not recognise .sops, and falls back to binary --
-    # which means JSON, so it fails to parse the file before it has so
-    # much as looked at a key.
+    # --input-type/--output-type are required: sops does not recognise .sops.
     out=$(mktemp); chmod 600 "$out"; cleanup_add "$out"
     sops_err=$(mktemp); cleanup_add "$sops_err"
     if SOPS_AGE_KEY_FILE="$key_candidate" \
@@ -743,11 +704,8 @@ if [[ -f $REPO_DIR/secrets/env.sops ]]; then
   (( attempt > 3 )) && warn "giving up after 3 attempts -- secrets will not be decrypted"
 fi
 
-# The compose variables that come from site.env rather than from sops.
-# run.sh acts on every one of them -- it creates and chowns those
-# directories and renders the Caddyfile from $DOMAIN -- so a copy compose
-# reads that could disagree would provision the host in one layout and run
-# it in another, with nothing to say so.
+# The compose variables that come from site.env rather than sops. run.sh
+# provisions with these, so compose must not read a different copy.
 SITE_ENV_KEYS=(PUID PGID TZ CONFIG DATA NAS DOMAIN)
 
 if [[ -n $DECRYPTED ]]; then
@@ -776,16 +734,11 @@ elif [[ ! -f $ENV_TARGET ]]; then
   warn "wrote a TEMPLATE .env -- fill it in before starting containers"
 fi
 
-# site.env wins, applied after both branches because the sops branch
-# rewrites $ENV_TARGET verbatim on every run and would otherwise put the
-# stale copies straight back. secrets/env.sops still carries PUID, PGID,
-# TZ, CONFIG, DATA and NAS; overwriting them here is what keeps that
-# harmless.
+# site.env wins, applied after both branches: the sops branch rewrites
+# $ENV_TARGET on every run, and secrets/env.sops still carries old copies.
 env_set() {
   local key=$1 val=$2
-  # sed_rhs because the substitution branch hands $val to sed, where an
-  # unescaped & expands to the whole match -- DOMAIN=a&b grew longer on
-  # every run. $key is a fixed uppercase name and needs no escaping.
+  # sed_rhs: an unescaped & in $val would expand to the whole match.
   if sudo grep -qs "^${key}=" "$ENV_TARGET"; then
     sudo sed -i "s|^${key}=.*|${key}=$(sed_rhs "$val")|" "$ENV_TARGET"
   else
@@ -800,18 +753,11 @@ if sudo test -f "$ENV_TARGET"; then
   ok "site.env values forced into $ENV_TARGET (${SITE_ENV_KEYS[*]})"
 fi
 
-# HEALTHCHECK_URL travels the other way. It is not a compose variable, but
-# it is a capability -- anyone holding it can send fake success pings and
-# silence the backup alarm -- so it lives in sops rather than in the
-# committed site.env.<host>, and a rebuilt host recovers its monitoring
-# from the same age key as everything else. site.env still wins if set.
+# HEALTHCHECK_URL is a capability, so it lives in sops, not in the committed
+# site.env.<host>. site.env still wins if set.
 if [[ -z ${HEALTHCHECK_URL:-} ]] && sudo test -f "$ENV_TARGET"; then
   HEALTHCHECK_URL=$(sudo sed -n 's/^HEALTHCHECK_URL=//p' "$ENV_TARGET" | head -1)
-  # Compose strips one layer of matched quotes from a .env value; sed does
-  # not. That mostly washes out, but HEALTHCHECK_URL="" -- how a .env says
-  # "no monitoring" -- is two characters rather than an empty string, so
-  # the test below would report monitoring enabled while backup.sh pings
-  # nothing.
+  # Strip one layer of matched quotes, as compose does: HEALTHCHECK_URL="" is empty.
   if (( ${#HEALTHCHECK_URL} >= 2 )) \
      && [[ $HEALTHCHECK_URL == \"*\" || $HEALTHCHECK_URL == \'*\' ]]; then
     HEALTHCHECK_URL=${HEALTHCHECK_URL:1:${#HEALTHCHECK_URL}-2}
@@ -827,30 +773,17 @@ sudo rsync -a --chown="$PUID:$PGID" \
   "$REPO_DIR/compose/" "$DOCKER_ROOT/"
 
 # --delete over stacks/ only, so a stack removed from the repo stops being
-# deployed. Not over the whole tree: $DOCKER_ROOT legitimately holds files
-# compose/ does not ship -- scripts/update.sh and the Caddyfile symlink.
-# .env stays excluded so the block below removes a stale stacks/.env
-# visibly rather than silently, in the middle of a sync of eleven others.
+# deployed; $DOCKER_ROOT also holds scripts/ and the Caddyfile link.
 sudo rsync -a --delete --chown="$PUID:$PGID" \
   --exclude '.env' \
   "$REPO_DIR/compose/stacks/" "$DOCKER_ROOT/stacks/"
 ok "compose files synced to $DOCKER_ROOT (stacks/ pruned of removals)"
 
-# stacks/.env is removed, not merely no longer created: compose
-# interpolates included files from the project-level .env, not from one
-# beside them (verified on bmo with it absent -- `docker compose config`
-# clean across all 31 services). Left in place it is a second path to
-# every secret in $ENV_TARGET, and reads as deliberate on a later audit.
+# stacks/.env is removed: compose reads the project-level .env, and a copy
+# here is a second path to every secret.
 if sudo test -e "$DOCKER_ROOT/stacks/.env" || sudo test -L "$DOCKER_ROOT/stacks/.env"; then
   sudo rm -f "$DOCKER_ROOT/stacks/.env"
   ok "removed the obsolete stacks/.env (compose reads $ENV_TARGET directly)"
-fi
-
-# network.yml ships an absolute build path; make it match this host
-if sudo grep -q 'build: /srv/docker/build/caddy' "$DOCKER_ROOT/stacks/network.yml" 2>/dev/null; then
-  sudo sed -i "s|build: /srv/docker/build/caddy|build: ${DOCKER_ROOT}/build/caddy|" \
-    "$DOCKER_ROOT/stacks/network.yml"
-  ok "patched caddy build path"
 fi
 
 # Site addresses from a Caddyfile: the lines opening a block in column 0.
@@ -870,11 +803,8 @@ CADDYFILE="$CONFIG/caddy/Caddyfile"
 # matches $DOMAIN by construction, so 1 is the right starting value.
 CADDY_DOMAIN_OK=1
 
-# Does the Caddyfile on disk serve $DOMAIN? Asked twice, because the
-# restore step replaces $CONFIG/caddy from a snapshot afterwards: a check
-# made only here would pass on the fresh render and miss the old domain's
-# file the restore puts back behind it. $1 names where the file came from,
-# since the remedy differs.
+# Does the Caddyfile on disk serve $DOMAIN? Asked again after a restore,
+# which brings back the snapshot's copy. $1 says where the file came from.
 check_caddy_domain() {
   local origin=$1 addr
   local -a addrs=() stale=()
@@ -904,11 +834,8 @@ check_caddy_domain() {
 }
 
 if [[ -f $CADDYFILE ]]; then
-  # Left alone on purpose: live configuration, hand-edited and restored
-  # from backup. Its domain is still checked, because changing DOMAIN in
-  # site.env moves .env, cloudflare-ddns and vaultwarden while this file
-  # goes on serving -- and renewing certificates for -- the old name,
-  # without anything erroring.
+  # Left alone: live, hand-edited configuration. Its domain is still checked,
+  # because changing DOMAIN moves everything else but not this file.
   check_caddy_domain "this file was already on the host; nothing here changed it."
   (( CADDY_DOMAIN_OK )) \
     && skip "Caddyfile exists and matches DOMAIN=$DOMAIN -- leaving it alone"
@@ -922,11 +849,7 @@ else
 fi
 
 LINK="$DOCKER_ROOT/Caddyfile"
-# Nothing reads this link: it exists so the Caddyfile is in reach from
-# $DOCKER_ROOT, where every `docker compose` in this repo is run from.
-# Flagged as a dead artifact once already, hence the note. Unlike the
-# stacks/.env above it cannot become a second source of truth -- a symlink
-# cannot drift from its target.
+# Nothing reads this link: it puts the Caddyfile in reach from $DOCKER_ROOT.
 if [[ -L $LINK || ! -e $LINK ]]; then
   sudo ln -sfn "$CONFIG/caddy/Caddyfile" "$LINK"
   sudo chown -h "$PUID:$PGID" "$LINK"
@@ -935,23 +858,15 @@ else
   warn "$LINK exists and is a real file, not a symlink -- left alone"
 fi
 
-# compose interpolates an unset variable to the empty string with one
-# warning line and carries on. An API key becomes a container that starts
-# and misbehaves; `${CONFIG}/prowlarr` becomes `/prowlarr`, which Docker
-# then creates at the root of the filesystem.
-#
-# Only the stacks in compose.yml's include: list are checked, and only a
-# bare `${VAR}` -- `${VAR:-default}` supplies its own value, so matching
-# it would report IMMICH_VERSION on every run of a correct .env.
+# compose turns an unset variable into an empty string and carries on, so
+# `${CONFIG}/x` becomes `/x`. Only included stacks, and only a bare `${VAR}`:
+# `${VAR:-default}` supplies its own value.
 if sudo test -f "$ENV_TARGET"; then
   mapfile -t included < <(
     sed -n '/^include:/,/^[^[:space:]#-]/p' "$REPO_DIR/compose/compose.yml" \
       | sed -n 's|^[[:space:]]*-[[:space:]]*stacks/\([A-Za-z0-9._-]*\.yml\).*|\1|p'
   )
 
-  # env_paths and env_present are sets rather than lists: the check below
-  # is pure membership, and asking it with `printf | grep -qxF` once per
-  # variable re-serialised and re-scanned the whole list ~40 times a run.
   env_required=(); declare -A env_paths=()
   for f in "${included[@]}"; do
     src="$REPO_DIR/compose/stacks/$f"
@@ -1013,11 +928,8 @@ if sudo test -f "$ENV_TARGET"; then
   fi
 fi
 
-# Group membership is fixed at login, so this shell may lack the docker
-# group just added above and `docker compose up -d` would fail with a
-# socket permission error that reads like a broken installation. `id -nG`
-# with no argument reports this process's own credentials, not what
-# /etc/group now says.
+# Group membership is fixed at login: this shell may predate the docker
+# group added above. `id -nG` with no argument reports this process.
 if id -nG 2>/dev/null | grep -qw docker; then
   START_HINT="cd $DOCKER_ROOT && docker compose up -d"
 else
@@ -1051,12 +963,8 @@ if ! grep -qs "^${NAS_HOST}:${NAS_EXPORT}[[:space:]]" /etc/fstab; then
 else
   skip "fstab entry present"
 
-  # An existing entry is never rewritten, so check its options rather than
-  # assume them. Without x-systemd.automount the export is mounted once at
-  # boot and, with nofail, never retried -- a slow NAS then leaves $NAS
-  # empty for the rest of the uptime, and every container bind-mounting it
-  # sees an empty directory rather than an error. The docker.service
-  # drop-in depends on this line carrying the option.
+  # An existing entry is never rewritten, so check it has x-systemd.automount:
+  # without it a slow NAS at boot leaves $NAS empty for the whole uptime.
   if ! grep -qs "^${NAS_HOST}:${NAS_EXPORT}[[:space:]].*x-systemd\.automount" /etc/fstab; then
     warn "the fstab entry for $NAS has no x-systemd.automount"
     warn "it will be mounted once at boot and never retried. Replace the line with:"
@@ -1103,13 +1011,9 @@ fi
 
 step "systemd units"
 
-# Rendered here rather than through install_templated: what goes in is an
-# escaped unit name, not a path. --suffix=automount, not mount -- naming
-# the .mount unit makes Wants= force the real NFS mount at boot and After=
-# wait out its timeout with the NAS down, the outage the automount exists
-# to prevent. Wants= on an .automount unit that does not exist is only a
-# logged warning, so docker still starts. sed_rhs because systemd-escape
-# emits backslash escapes, which sed would read as escapes of its own.
+# Rendered here, not through install_templated: it takes an escaped unit
+# name. The .automount unit, not .mount: Wants= on the .mount would force
+# the NFS mount at boot and wait out its timeout with the NAS down.
 nas_mount_unit=$(systemd-escape -p --suffix=automount "$NAS")
 sudo mkdir -p /etc/systemd/system/docker.service.d
 sed "s|{{NAS_MOUNT_UNIT}}|$(sed_rhs "$nas_mount_unit")|g" \
@@ -1122,58 +1026,53 @@ install_templated "$REPO_DIR/files/scripts/update.sh" \
   "$DOCKER_ROOT/scripts/update.sh" -m 0755 -o "$PUID" -g "$PGID"
 install_templated "$REPO_DIR/files/systemd/docker-update.service" \
   /etc/systemd/system/docker-update.service -m 0644
+sudo install -m 0644 "$REPO_DIR/files/systemd/docker-update.timer" \
+  /etc/systemd/system/docker-update.timer
 sudo systemctl daemon-reload
 
-if prompt_yn "enable docker-update.service (pulls latest images on every boot)?"; then
-  sudo systemctl enable docker-update.service >/dev/null
-  ok "docker-update.service enabled"
+if prompt_yn "enable docker-update.timer (pulls latest images after boot and every Sunday)?"; then
+  sudo systemctl enable docker-update.timer >/dev/null
+  ok "docker-update.timer enabled"
 else
-  skip "docker-update.service installed but not enabled"
+  skip "docker-update.timer installed but not enabled"
 fi
 
 step "Firewall"
 
-# Scope: ufw filters the host's INPUT chain, covering SSH, cockpit and
-# every network_mode: host container -- technitium's DNS on 53 above all,
-# since an open resolver gets conscripted into amplification attacks.
-#
-# It does NOT cover Docker's published ports, for which Docker inserts its
-# own rules ahead of ufw's; restricting those needs DOCKER-USER rules this
-# script does not write. Hence no Cloudflare-range rules here: they read
-# as though 443 were closed to everyone else and did nothing at all.
+# ufw filters the host's INPUT chain: SSH, cockpit and every network_mode:
+# host container, technitium's DNS on 53 above all. Docker's IPv4 published
+# ports bypass it; IPv6 ones reach containers through docker-proxy on the
+# host (core has no IPv6), so ufw does filter those.
 
 sudo ufw --force default deny incoming >/dev/null
 sudo ufw --force default allow outgoing >/dev/null
 
 sudo ufw allow in on tailscale0 >/dev/null
 sudo ufw allow from "$LAN_SUBNET" >/dev/null
-sudo ufw allow 22/tcp >/dev/null
 sudo ufw allow 41641/udp >/dev/null           # tailscale direct
+sudo ufw allow 25565/tcp >/dev/null           # minecraft
 
-# syncthing's admin GUI. syncthing is network_mode: host, so unlike every
-# other service here it really is on the host's INPUT chain. Only caddy
-# needs to reach it, and the packet arrives from caddy's address on the
-# core bridge -- so the source is core's subnet, not Docker's whole
-# 172.16.0.0/12 pool, which would expose the admin interface of the
-# service holding $DATA/sync to every container on the host.
-#
-# Asked of docker because `docker network create core` pins no --subnet.
-# The trailing space in the template matters: without it a dockerd with
-# IPv6 answers `172.20.0.0/16fd00:dead::/64`, one token matching nothing,
-# which sends this to the fail-closed branch below. Take the first IPv4
-# entry -- the rule is about caddy's v4 address on the bridge.
+if cf_v6=$(curl -fsS -m 10 https://www.cloudflare.com/ips-v6); then
+  for net in $cf_v6; do
+    [[ $net =~ ^[0-9a-f:]+/[0-9]+$ ]] || { warn "skipping odd Cloudflare range: $net"; continue; }
+    sudo ufw allow proto tcp from "$net" to any port 443 >/dev/null
+  done
+  ok "443 open to Cloudflare's IPv6 ranges"
+else
+  warn "could not fetch Cloudflare's IPv6 ranges -- 443 rules not written, and the"
+  warn "public sites need them. Re-run, or see https://www.cloudflare.com/ips-v6"
+fi
+
+# syncthing (network_mode: host) serves its GUI on the host. Only caddy
+# needs it, from core's subnet rather than Docker's whole 172.16.0.0/12.
+# Asked of docker because core pins no --subnet; take the first IPv4 entry.
 core_subnet=$(sudo docker network inspect -f \
   '{{range .IPAM.Config}}{{.Subnet}} {{end}}' core 2>/dev/null \
   | tr ' ' '\n' | grep -m1 -E '^[0-9.]+/[0-9]+$' || true)
 
 if [[ $core_subnet =~ ^[0-9.]+/[0-9]+$ ]]; then
-  # Sweeps any 8384 rule whose source is not core's current subnet; ufw
-  # refusing to delete a rule that is not there is not an error here.
-  #
-  # `show added`, not `status`: this runs before `ufw --force enable`, and
-  # on an inactive firewall `status` prints no rule rows at all -- so the
-  # stale /12 would survive in the rule database and come back up with the
-  # enable. `show added` reports that database either way.
+  # Sweep 8384 rules whose source is not core's current subnet. `show added`,
+  # not `status`: an inactive firewall lists no rules in `status`.
   while read -r stale; do
     [[ $stale == "$core_subnet" ]] && continue
     sudo ufw delete allow from "$stale" to any port 8384 proto tcp >/dev/null 2>&1 || true
@@ -1255,18 +1154,10 @@ else
   fi
 fi
 
-# Repository passphrase, and reconnecting with it -- never init.
+# Passphrase prompt and verification are one loop, as for the age key.
 #
-# Prompt and verification are one loop, for the same reason as the age key
-# above: gating on the file existing made a single typo permanent, and the
-# nightly timer went on failing against a repository it could not open. A
-# passphrase that does not open the repository never overwrites one that
-# might.
-# $1 = password file. Prints the snapshot list as JSON; a non-zero exit is
-# "the repository could not be opened", and an empty repository is a clean
-# exit with an empty list. Listing rather than probing, because the caller
-# wants the count too and opening the repository twice to answer one
-# question is two ssh sessions and two key derivations.
+# $1 = password file. Prints the snapshot list as JSON; non-zero means the
+# repository could not be opened.
 restic_snapshots() {
   sudo restic -r "$RESTIC_REPO" --password-file "$1" snapshots --json 2>/dev/null
 }
@@ -1342,13 +1233,9 @@ while (( ++attempt <= 3 )); do
 done
 (( attempt > 3 )) && warn "giving up after 3 attempts -- backups not configured"
 
-# Is this host empty enough that a restore is what it wants?
-#
-# "The repository has snapshots" is NOT the signal: every run on a healthy
-# host satisfies it, and a restore there overwrites 31 running services
-# with last night's state. The signal is that this host has no service
-# state of its own -- the first regular file under $CONFIG, excluding the
-# Caddyfile this run renders, was put there by a container.
+# Is this host empty enough that a restore is what it wants? Not 'the
+# repository has snapshots' (true on every healthy host), but 'no regular
+# file under $CONFIG besides the Caddyfile this run renders'.
 snap_count=${snap_count:-0}
 config_state=""
 if sudo test -d "$CONFIG"; then
@@ -1376,28 +1263,14 @@ fi
 
 if sudo test -f "$RESTIC_PASS_FILE"; then
 
-  # Config for the systemd job, independent of this git checkout.
-  #
-  # BACKUP_HOST is written as a literal, fixed at whatever this host was
-  # called when it was provisioned: reading the live hostname would let a
-  # rename start a second snapshot history `forget --host` never prunes.
-  # DATA_IS_MOUNT keeps its site.env name so the two guards are one switch
-  # rather than two that can disagree. DOCKER_ROOT is stated for
-  # restore.sh, which is installed verbatim and would otherwise infer it
-  # as $(dirname "$CONFIG") -- site.env sets the two independently, and
-  # nothing makes CONFIG a child of DOCKER_ROOT.
+  # Config for the systemd job, independent of this checkout. BACKUP_HOST is
+  # pinned so a rename cannot fork the snapshot history; DOCKER_ROOT is stated
+  # because CONFIG need not be its child.
   backup_host="${BACKUP_HOST:-$(hostname -s 2>/dev/null || true)}"
   [[ -n $backup_host ]] || die "cannot determine a backup host name -- set BACKUP_HOST in config/site.env"
 
-  # %q because backup.sh and restore.sh both *source* this file: an
-  # unquoted value holding a shell metacharacter is code, not data. A
-  # HEALTHCHECK_URL query string -- .../ping?rid=a&env=prod -- would end
-  # the assignment at the `&`, killing the backup at source time, before
-  # it could send the failure ping that lives in the file that just failed
-  # to parse.
-  #
-  # Safe because both consumers are bash. A systemd EnvironmentFile parses
-  # quotes but not %q's $'...' form.
+  # %q because backup.sh and restore.sh source this file (both bash): an
+  # unquoted & in HEALTHCHECK_URL would break the assignment.
   env_line() { printf '%s=%q\n' "$1" "$2"; }
 
   {
@@ -1442,14 +1315,8 @@ if sudo test -f "$RESTIC_PASS_FILE"; then
   sudo systemctl enable --now bmo-backup.timer >/dev/null
   ok "bmo-backup.timer enabled ($(systemctl show -p TimersCalendar --value bmo-backup.timer 2>/dev/null | head -1))"
 
-  # Installing the backup does not take one -- the timer first fires at
-  # 03:30, and that gap is how a host gets reformatted on the strength of
-  # a backup system that has never written a snapshot.
-  #
-  # Not under --yes, and not when a restore is on the cards: snapshotting
-  # an empty host spends a `forget --keep-last` slot on nothing and puts
-  # that snapshot at the top of `--list`, which is the one reached for
-  # first.
+  # Installing the backup does not take one. Not offered under --yes, nor when
+  # a restore is likely: a snapshot of an empty host would top --list.
   if (( repo_ok )) && ! (( RESTORE_PLAUSIBLE )); then
     if (( ASSUME_YES )); then
       warn "no backup has been taken yet -- run: sudo /usr/local/sbin/bmo-backup"
@@ -1463,15 +1330,8 @@ if sudo test -f "$RESTIC_PASS_FILE"; then
   fi
 fi
 
-# Everything above builds the *shape* of the host and restores not one row
-# of anybody's database, leaving a rebuilt host one `docker compose up -d`
-# away from 31 services initialising fresh empty databases into the
-# directories the real ones belong in. Nothing fails; they come up looking
-# merely "reset", and the next nightly backup snapshots that over the top.
-#
-# So the restore belongs here: after the repository is reachable and
-# $CONFIG exists, and before the stack is ever started. It is never
-# automatic -- see RESTORE_PLAUSIBLE above.
+# Restore before the stack ever starts: a service started on an empty
+# directory writes a fresh database there. Never automatic.
 
 step "Restore"
 
@@ -1531,10 +1391,7 @@ step "Verification"
 
 printf '  %-22s %s\n' "NAS mounted:"   "$(mountpoint -q "$NAS" && echo yes || echo NO)"
 printf '  %-22s %s\n' "data disk:"     "$(mountpoint -q "$DATA" && echo yes || echo 'NO (check UUID in fstab)')"
-# `|| true` because a non-zero here is the answer, not a fault:
-# `systemctl is-active` exits 3 for inactive having already printed the
-# word this line reports, and would otherwise reach the ERR trap and print
-# a FAILED frame in the middle of the summary.
+# `|| true`: systemctl is-active exits 3 for inactive, after printing it.
 printf '  %-22s %s\n' "docker:"        "$(systemctl is-active docker || true)"
 printf '  %-22s %s\n' "core network:"  "$(sudo docker network inspect core >/dev/null 2>&1 && echo yes || echo NO)"
 printf '  %-22s %s\n' ".env:"          "$([[ -s $ENV_TARGET ]] && echo present || echo MISSING)"

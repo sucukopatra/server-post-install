@@ -47,23 +47,12 @@ for v in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE CONFIG DATA; do
 done
 [[ -r $RESTIC_PASSWORD_FILE ]] || die "cannot read $RESTIC_PASSWORD_FILE"
 
-# A dead-man's switch: ping on start, success and failure, and if the
-# success ping does not arrive on schedule the far end raises the alarm.
-#
-# Deliberately not OnFailure= in the unit, which only fires when the unit
-# runs and fails -- nothing on this host can report that the host is dead,
-# the timer was disabled, or the disk filled up before systemd started
-# anything, which is how a backup actually goes quiet. Here silence is the
-# signal, so a broken notifier and a broken backup both reach you.
-#
-# Empty HEALTHCHECK_URL disables it. Pings are best-effort and never
-# affect the exit status: a monitoring endpoint that is down must not be
-# able to fail a backup that is otherwise fine.
+# Dead-man's switch: ping on start, success and failure. Not OnFailure=,
+# which cannot report a dead host or a disabled timer. Empty disables it;
+# a failed ping never fails the backup.
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 
-# Bounded timeouts: at curl's defaults an endpoint that blackholes packets
-# costs ~46s per ping, twice a run. --retry-max-time caps the whole
-# attempt, not each try.
+# Bounded: at curl's defaults a blackholed endpoint costs ~46s per ping.
 ping_hc() {
   local path=${1:-} body=${2:-} retries=${3:-2}
   [[ -n $HEALTHCHECK_URL ]] || return 0
@@ -112,10 +101,7 @@ export HOME="${HOME:-/root}"
 # whose retention never touches the first. run.sh pins it in $ENV_FILE.
 BACKUP_HOST="${BACKUP_HOST:-${HOSTNAME%%.*}}"
 
-# Tested on the value rather than chained to cat's exit status: an empty
-# /etc/hostname leaves cat exiting 0, and every restic call would then run
-# with --host "", forking exactly the second snapshot history the note
-# above guards against. Whitespace is stripped so " " cannot pass -n.
+# Tested on the value: an empty /etc/hostname must not mean --host "".
 if [[ -z $BACKUP_HOST ]]; then
   BACKUP_HOST=$(cat /etc/hostname 2>/dev/null || true)
   BACKUP_HOST=${BACKUP_HOST//[[:space:]]/}
@@ -133,32 +119,20 @@ KEEP_MONTHLY="${KEEP_MONTHLY:-6}"
 # run; RESTIC_CHECK=0 disables it outright.
 CHECK_INTERVAL_DAYS="${CHECK_INTERVAL_DAYS:-7}"
 
-# A live service's dump is rewritten nightly, so one older than this
-# belongs to a service that no longer runs. Generous on purpose: it must
-# not catch a merely stopped container, whose live data directory is
-# excluded from the backup and whose dump is the only copy.
+# A dump not refreshed in this many days belongs to a service that no longer
+# runs. Generous: a stopped container's dump is the only copy of its database.
 DUMP_KEEP_DAYS="${DUMP_KEEP_DAYS:-30}"
 
-# How stale a dump may be before the run says so. Independent of
-# DUMP_KEEP_DAYS above, which is about deletion: a dump can be far too old
-# to stand for tonight's database and nowhere near old enough to be
-# removed, and that gap is where a failing dump used to hide. Two nights,
-# so a single failure tonight's run has already made good is not reported.
+# How stale a dump may be before the run reports it, apart from deletion
+# above. Two nights, so one failure already made good is not reported.
 DUMP_STALE_HOURS="${DUMP_STALE_HOURS:-48}"
 
-# How long to wait for a database container to start answering before
-# giving up on its dump. Generous on purpose: this runs at 03:30 with
-# nobody waiting, and crash recovery on a large database is minutes, while
-# the cost of not waiting is a night with no dump. Only containers that
-# are already up are waited on, so a stopped service costs nothing.
+# How long to wait for a running database container to answer; on timeout
+# the dump is tried anyway.
 DB_READY_TIMEOUT="${DB_READY_TIMEOUT:-300}"
 
-# How often the dumps are read back out of the repository and validated,
-# in days. Separate from CHECK_INTERVAL_DAYS above because they answer
-# different questions: `restic check` asks whether the repository is
-# structurally sound, this asks whether the files it holds are the ones we
-# would need. A sound repository full of truncated dumps passes the first
-# and fails this. 0 means every run; VERIFY_DUMPS=0 disables it outright.
+# How often the dumps are read back from the repository and validated, in
+# days. 0 means every run; VERIFY_DUMPS=0 disables it.
 VERIFY_INTERVAL_DAYS="${VERIFY_INTERVAL_DAYS:-7}"
 
 for v in CHECK_INTERVAL_DAYS DUMP_KEEP_DAYS DUMP_STALE_HOURS DB_READY_TIMEOUT \
@@ -168,35 +142,23 @@ done
 
 command -v restic >/dev/null || die "restic is not installed"
 
-# Only one run at a time. bmo-restore takes this same lock, and that is
-# the more important half: a restore of a rebuilt host runs for hours and
-# can span 03:30, and without the lock this run would dump the databases
-# of engines the restore has just started on empty data directories,
-# snapshot a half-restored $CONFIG, and prune. That snapshot looks healthy
-# and is `latest`.
+# One run at a time. bmo-restore takes this lock too, so a backup cannot
+# snapshot a half-restored host as `latest` and prune.
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-  # No alarm: the run holding the lock will ping when it finishes, and a
-  # /fail here would be a false alarm. A restore holding it ends the night
-  # with no ping at all, which is correct -- no backup was taken, and the
-  # monitor's grace period is what should say so.
+  # No alarm: whoever holds the lock reports for tonight.
   NO_PING=1
   die "another backup or a restore is already running (holds $LOCK_FILE)"
 fi
 
-# With the lock held, the run really begins -- so the clock the monitor
-# measures against starts here. No retries: losing this ping costs only a
-# duration reading, and the pings carrying the outcome do retry.
+# The run really starts here, so the monitor's clock does too.
 ping_hc /start "" 0
 
 [[ -d $CONFIG ]] || die "CONFIG=$CONFIG does not exist"
 [[ -d $DATA   ]] || die "DATA=$DATA does not exist"
 
-# With the data disk unmounted $DATA is an empty directory on the root
-# filesystem, and backing that up looks like "the user deleted
-# everything" -- after enough retention cycles the real snapshots age out.
-# Same name as DATA_IS_MOUNT in config/site.env, which run.sh copies into
-# $ENV_FILE, so the two guards are one switch.
+# An unmounted $DATA is an empty directory; backing it up looks like a mass
+# deletion and ages the real snapshots out.
 if [[ ${DATA_IS_MOUNT:-1} == 1 ]] && ! mountpoint -q "$DATA"; then
   die "$DATA is not a mount point -- data disk missing? (set DATA_IS_MOUNT=0 in $ENV_FILE to allow)"
 fi
@@ -221,13 +183,9 @@ if ! restic cat config >/dev/null 2>&1; then
 fi
 log "repository open: $RESTIC_REPOSITORY"
 
-# A file-level copy of a database being written to is not a backup -- it
-# restores torn, or silently stale. So each live database gets a logical
-# dump here and its on-disk directory is excluded from the backup below.
-#
-# Uncompressed on purpose: restic deduplicates a nightly dump against
-# yesterday's and compresses on its own for v2 repositories. Gzipping
-# first would defeat both.
+# A file copy of a live database is not a backup, so each engine is dumped
+# here and its data directory excluded below. Uncompressed, so restic can
+# deduplicate and compress it.
 
 DUMP_DIR="$CONFIG/_dumps"
 install -d -m 0700 "$DUMP_DIR"
@@ -238,39 +196,16 @@ running() {
   [[ $(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null) == true ]]
 }
 
-# Wait for a database container to be able to answer queries.
-#
-# `running` above is not this, and the difference is the whole point. A
-# container is "running" from the moment the engine forks -- through
-# initdb, through crash recovery, before the socket is even bound -- so
-# dumping on that signal alone produces exactly the two failures this
-# exists to stop: "Connection refused" before the bind, and "the database
-# system is starting up" after it. Docker health status does mean
-# something, and every engine image on this host declares one. $probe is
-# the fallback for an image that ever drops its healthcheck, so this
-# cannot quietly degrade back to "the process exists".
-#
-# A timeout here is advisory, not fatal: both callers warn and dump
-# anyway. An engine that never reports healthy may still answer queries
-# perfectly well -- the Immich image's healthcheck also fails on detected
-# checksum corruption, which is exactly when its dump matters most -- and
-# refusing to try would lose a dump this script used to take. So the
-# worst this function can do is delay a dump by $DB_READY_TIMEOUT.
-#
-# Deliberately duplicated from restore.sh rather than factored into a
-# shared file. Both scripts are installed standalone into /usr/local/sbin
-# and must keep working when the git checkout they came from is gone --
-# which, for restore.sh, is the situation it is FOR. A library between
-# them is one more thing a partial install can leave behind.
+# Wait until a database container can answer queries: 'running' starts
+# before the socket is bound. Health status first, $probe for an image
+# without one. A timeout is advisory; callers dump anyway. Duplicated in
+# restore.sh on purpose: both are installed standalone.
 wait_ready() {
   local c=$1 probe=${2:-} timeout=${3:-$DB_READY_TIMEOUT}
   local waited=0 interval=2 state health inspected
 
   while (( waited < timeout )); do
-    # Status and health in one inspect, not two: this polls every 2s, and
-    # asking the daemon twice per tick for two fields of the same object
-    # is round trips nobody needs. The separator cannot appear in either
-    # value.
+    # Status and health in one inspect; the separator cannot appear in either.
     state=missing health=""
     if inspected=$(docker inspect \
          -f '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
@@ -287,10 +222,6 @@ wait_ready() {
 
     if [[ -n $health ]]; then
       if [[ $health == healthy ]]; then
-        # Silent on the normal night, when this returns on the first tick
-        # with waited=0. A line here every run would be one more thing to
-        # read past, and the number is only interesting when there was a
-        # wait to report.
         (( waited )) && log "  $c ready after ${waited}s"
         return 0
       fi
@@ -300,9 +231,7 @@ wait_ready() {
         return 0
       fi
     else
-      # No healthcheck and no probe: there is nothing to wait on, and
-      # dumping blind is what this script did before this function
-      # existed. Still better than skipping the dump.
+      # No healthcheck and no probe: dump blind rather than skip.
       return 0
     fi
 
@@ -312,14 +241,8 @@ wait_ready() {
   return 1
 }
 
-# A dump that exits 0 and is non-empty can still be truncated: a `docker
-# exec` killed mid-stream, a disk that fills at 90%, an engine that errors
-# after emitting half the schema. Both engines close a complete dump with
-# a fixed trailer, so whether that line is present is the difference
-# between "the command ran" and "the dump is whole".
-#
-# tail -c rather than grep over the file: these run over dumps that can be
-# hundreds of megabytes, and the trailer is always the last line.
+# A dump can exit 0 and still be truncated; both engines end a complete dump
+# with a fixed trailer. tail -c, not grep, on files of hundreds of MB.
 valid_postgres_dump() {
   tail -c 200 | grep -q 'PostgreSQL database cluster dump complete'
 }
@@ -328,17 +251,8 @@ valid_mariadb_dump() {
   tail -c 200 | grep -q '^-- Dump completed'
 }
 
-# Temp file and rename, so an interrupted dump cannot replace a good one
-# with a truncated one. stderr is left alone: when a dump fails, the
-# engine's own message in the journal is the only useful diagnosis.
-#
-# $validate is the name of a function reading the temp file; it runs before
-# the rename, so a dump that fails it is discarded exactly like a dump
-# whose command exited non-zero, leaving the previous good copy in place.
-# That is the right direction -- a truncated dump is worse than yesterday's
-# complete one -- and it is only safe because the staleness check further
-# down then reports the surviving dump aging out. The two are a pair;
-# removing either one alone puts the silence back.
+# Temp file and rename, so a failed or truncated dump keeps yesterday's good
+# copy. The staleness check below is what then reports it aging.
 dump_to() {
   local out=$1 validate=$2; shift 2
   if "$@" > "$out.tmp" && [[ -s $out.tmp ]] && "$validate" < "$out.tmp"; then
@@ -383,14 +297,8 @@ dump_mariadb() {
     || fail "mariadb-dump failed or produced a truncated dump for $container"
 }
 
-# Everything else here is SQLite. `.backup` uses SQLite's online backup
-# API, the only correct way to copy a database open in WAL mode, and
-# databases are discovered rather than listed so a new service cannot
-# silently go unprotected.
-#
-# The dumped files are recorded as exact paths, never a glob: `*.db` would
-# also match files dump_sqlite skips for failing the SQLite magic check,
-# and those would then be in no copy at all.
+# Everything else is SQLite. `.backup` is the only correct copy of a database
+# open in WAL mode. Databases are discovered, and recorded as exact paths.
 SQLITE_DUMPED=()
 
 dump_sqlite() {
@@ -405,9 +313,7 @@ dump_sqlite() {
     # would break out of.
     [[ $db == *"'"* ]] && { fail "skipping path with a quote: $db"; continue; }
 
-    # *.db is also used by things that are not SQLite. Read with the
-    # builtin rather than `head -c`: this walks every file under $CONFIG,
-    # and on this host that is a fork per candidate to look at 15 bytes.
+    # *.db is not always SQLite. The builtin read avoids a fork per file.
     magic=""; read -r -N 15 magic < "$db" 2>/dev/null || true
     [[ $magic == "SQLite format 3" ]] || continue
 
@@ -415,22 +321,11 @@ dump_sqlite() {
     out="$DUMP_DIR/sqlite/$rel"
     install -d -m 0700 "$(dirname "$out")"
 
-    # integrity_check on the copy, not the original: the question is
-    # whether the file about to become the only copy in the backup is
-    # sound, and .backup can produce a damaged one from a healthy source
-    # (a disk filling up mid-copy). It returns the single word `ok`, or
-    # one line per problem found. Full check rather than quick_check --
-    # these are application config databases of a few MB and it costs
-    # milliseconds; revisit only if one ever grows enough to be felt.
+    # integrity_check on the copy: it is about to be the only copy in the backup.
     if sqlite3 "$db" ".backup '$out.tmp'" 2>/dev/null && [[ -s $out.tmp ]] \
        && [[ $(sqlite3 "$out.tmp" 'PRAGMA integrity_check' 2>/dev/null) == ok ]]; then
-      # Carry the live file's ownership and mode onto the dump. sqlite3
-      # runs as root, so .backup writes root:root 0644, and restore.sh's
-      # `cp -a` preserves exactly that -- every restored database owned by
-      # root, for services that run as $PUID. This is the only place the
-      # original is still knowable: the live file is excluded from the
-      # snapshot. Applied before the rename, so the published dump never
-      # exists with the wrong owner even briefly.
+      # Carry the live file's owner and mode onto the dump (sqlite3 runs as root),
+      # so restore.sh's cp -a puts them back.
       chown --reference="$db" "$out.tmp" 2>/dev/null || true
       chmod --reference="$db" "$out.tmp" 2>/dev/null || true
       mv -f "$out.tmp" "$out"
@@ -453,18 +348,8 @@ check_immich_dump() {
   local dir="$DATA/photos/backups" newest total
   running immich_postgres || return 0
 
-  # Matched by name, not "any file under $dir". Immich drops a `.immich`
-  # marker file into the directories it owns and touches it on startup,
-  # and with `-print -quit` taking whatever the directory order hands over
-  # first, that marker is what this reported as the current dump -- so the
-  # one check standing between a broken Immich backup setting and an
-  # unrestorable snapshot passed on the strength of a zero-byte marker.
-  #
-  # Loose about what follows the prefix (the name carries a timestamp and
-  # the server and PostgreSQL versions, and that scheme has changed
-  # before) and strict about the prefix, which has not. A rename upstream
-  # therefore reads as "no dump" -- a false alarm, which is the right way
-  # for this particular check to be wrong.
+  # Matched by name: Immich also keeps a zero-byte `.immich` marker here. Strict
+  # prefix, loose suffix; an upstream rename reads as 'no dump', a false alarm.
   local pat='immich-db-backup-*.sql*'
   newest=$(find "$dir" -type f -name "$pat" ! -name '*.tmp' -newermt '-48 hours' -print -quit 2>/dev/null || true)
   if [[ -n $newest ]]; then
@@ -475,19 +360,9 @@ check_immich_dump() {
   fi
 }
 
-# The engine databases on this host: which container holds each one, what
-# engine it runs, and where its live data directory is.
-#
-# One table rather than two, because the dump loop below and the exclusion
-# loop further down are the same three rows read for different reasons --
-# and a container dumped but missing from the exclusions puts the live
-# directory into the snapshot next to its own dump, invisibly until a
-# restore puts the torn copy back.
-#
-# Keys are container names, because that is what dump_to writes as
-# $DUMP_DIR/<container>.sql. Services absent from this host are skipped by
-# both loops, so synapse is listed even though it is not deployed:
-# enabling stacks/matrix.yml must not quietly reintroduce the hole.
+# The engine databases: container, engine, live data directory. One table for
+# the dump loop and the exclusion loop, so a dumped container cannot miss its
+# exclusion. synapse stays listed so enabling matrix.yml is covered.
 declare -A SQL_ENGINE=(
   [immich_postgres]=postgres      # immich's own dump is the restore path
   [synapse-db]=postgres
@@ -501,8 +376,7 @@ declare -A SQL_LIVE_DIR=(
 
 log "dumping databases"
 if have_docker; then
-  # Sorted, so the log reads the same way every night; an associative
-  # array's own iteration order is unspecified.
+  # Sorted, so the log reads the same every night.
   for c in $(printf '%s\n' "${!SQL_ENGINE[@]}" | sort); do
     case ${SQL_ENGINE[$c]} in
       postgres) dump_postgres "$c" ;;
@@ -516,18 +390,9 @@ else
 fi
 dump_sqlite
 
-# $DUMP_DIR is inside $CONFIG, so a dropped service's last dump would
-# otherwise go into every snapshot from then on, forever.
-#
-# Age, not "was it written this run": a dump that failed tonight keeps its
-# previous good copy (see dump_to) and a stopped container writes nothing,
-# and deleting either would throw away the only copy of a database whose
-# live directory is excluded from the backup. Nothing legitimate goes
-# untouched for DUMP_KEEP_DAYS.
-#
-# Runs before the backup so a stale dump misses tonight's snapshot.
-# `|| true` because pipefail would otherwise turn one unreadable file into
-# a failed assignment and abort the run over housekeeping.
+# Remove dumps not refreshed in DUMP_KEEP_DAYS (a dropped service). Age, not
+# 'written this run': a failed or stopped service's dump is its only copy.
+# `|| true` so housekeeping cannot abort the run.
 stale=$(find "$DUMP_DIR" -type f ! -newermt "-${DUMP_KEEP_DAYS} days" -print -delete 2>/dev/null | wc -l || true)
 if (( stale )); then
   log "  removed $stale dump(s) not refreshed in ${DUMP_KEEP_DAYS} days"
@@ -535,9 +400,7 @@ if (( stale )); then
   find "$DUMP_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 fi
 
-# Removed by the single EXIT trap installed above: a second `trap ... EXIT`
-# here would replace it outright, and the run would stop reporting to the
-# monitor altogether.
+# Removed by the EXIT trap above; a second EXIT trap would replace it.
 EXCLUDES=$(mktemp)
 
 cat > "$EXCLUDES" <<EOF
@@ -562,15 +425,8 @@ $DUMP_DIR/**/*.tmp
 # the root of \$DATA. If one ever does, exclude it then, on evidence.
 EOF
 
-# Live database directories, dumped above instead because a file-level
-# copy taken while the engine runs does not reliably restore.
-#
-# Each is excluded ONLY when its dump is actually on disk -- that
-# condition is the whole point of this block. Unconditional lines in the
-# heredoc above are the one arrangement able to produce a snapshot holding
-# neither the dump nor the data it stands for, invisibly until a restore.
-#
-# The paths come from SQL_LIVE_DIR, declared beside the dump loop above.
+# Live database directories, excluded ONLY when their dump is on disk, so a
+# snapshot can never hold neither.
 for c in "${!SQL_LIVE_DIR[@]}"; do
   live=${SQL_LIVE_DIR[$c]}
   # Not deployed here: nothing to exclude and nothing to warn about.
@@ -578,20 +434,8 @@ for c in "${!SQL_LIVE_DIR[@]}"; do
   if [[ -s $DUMP_DIR/$c.sql ]]; then
     printf '%s\n' "$live" >> "$EXCLUDES"
 
-    # Existence is not freshness, and treating it as freshness is how a
-    # failed dump goes quiet. dump_to keeps the previous good copy when
-    # tonight's dump fails, which is right -- but the exclusion just
-    # written then ships a snapshot whose only copy of this database is
-    # however old that file is, and nothing anywhere said so. The dump
-    # still beats a file-level copy of a live engine, so it stays
-    # excluded and this is loud instead.
-    #
-    # Note what this catches that the dump step cannot: a dump that has
-    # been failing for a week reports one failure per night and looks
-    # like tonight's transient. This reports the thing that actually
-    # matters -- that the snapshot no longer contains a current copy.
-    # DUMP_KEEP_DAYS would eventually notice by deleting the file, three
-    # weeks too late and by then the live directory is unprotected too.
+    # Existence is not freshness: a dump that keeps failing leaves an old copy in
+    # place, and this is what says the snapshot no longer has a current one.
     if [[ -z $(find "$DUMP_DIR/$c.sql" -newermt "-${DUMP_STALE_HOURS} hours" -print -quit 2>/dev/null) ]]; then
       fail "$DUMP_DIR/$c.sql has not been refreshed in ${DUMP_STALE_HOURS}h -- the snapshot excludes the live $live in favour of a stale dump"
     fi
@@ -600,25 +444,13 @@ for c in "${!SQL_LIVE_DIR[@]}"; do
     # written to as it is read. Worth failing the run over.
     fail "no dump at $DUMP_DIR/$c.sql and $c is running -- keeping the live $live in the backup instead, which may restore torn"
   else
-    # A stopped engine's data directory copies perfectly well, so this is
-    # the arrangement working; calling it a fault nightly would train
-    # someone to ignore it.
+    # A stopped engine's data directory copies fine.
     log "  no dump for $c and it is not running -- backing up the live $live (safe: engine stopped)"
   fi
 done
 
-# The live SQLite files whose clean copy now sits in $DUMP_DIR/sqlite.
-# Having both in one snapshot is the thing to avoid: `restic restore
-# --target /` would put the live copy back over the real path and leave
-# the good one unused in _dumps, silently restoring stale or torn data.
-#
-# The -wal, -shm and -journal sidecars go too. SQLite pairs them with the
-# main file by salt, so a WAL from a different instant either refuses the
-# database or replays a checkpoint it never had.
-#
-# A file whose dump FAILED is deliberately absent, so it stays in the
-# backup: fail() has recorded the problem, and a copy that might be torn
-# beats none.
+# Exclude the live SQLite files whose clean copy is in $DUMP_DIR/sqlite, with
+# their -wal/-shm/-journal sidecars. A failed dump keeps its live file in.
 if (( ${#SQLITE_DUMPED[@]} )); then
   for db in "${SQLITE_DUMPED[@]}"; do
     printf '%s\n%s-wal\n%s-shm\n%s-journal\n' "$db" "$db" "$db" "$db"
@@ -683,14 +515,8 @@ restic forget --prune \
   --keep-monthly "$KEEP_MONTHLY" \
   || fail "restic forget/prune failed"
 
-# Structural check only: indexes and metadata, without pulling every pack
-# back over sftp. RESTIC_CHECK=0 skips it.
-#
-# Driven by a stamp file rather than the day of the week, because this
-# host is not guaranteed to be powered on on any given day and "check on
-# Sundays" would then never run. The stamp is written only on a check that
-# passed, so a failing repository is re-checked on the next run instead of
-# going quiet for another week.
+# Structural check only. The interval runs from a stamp written on success,
+# since bmo is not always on; a failing repository is re-checked next run.
 if [[ ${RESTIC_CHECK:-1} != 1 ]]; then
   log "repository check disabled (RESTIC_CHECK=0)"
 else
@@ -716,17 +542,9 @@ fi
 
 # ------------------------------------------------------- verifying dumps
 
-# `restic check` above proves the repository is structurally sound. It does
-# not open a single dump. Everything before it proves a dump was *written*.
-# This is the only thing here that proves one can be *read back*, which is
-# the property the whole arrangement rests on: for every database on this
-# host the live files are excluded from the snapshot, so a dump is not a
-# spare copy, it is the copy.
-#
-# Streamed rather than staged wherever a stream is enough. The Immich
-# cluster dump is the largest file in $DUMP_DIR and is already on the root
-# filesystem once; restoring a second copy to look at it is how a
-# verification step fills the disk it exists to protect.
+# `restic check` proves the repository is sound; this proves the dumps can be
+# read back and are whole. Streamed where possible, so verifying does not
+# fill the disk.
 
 decompress() {
   if [[ $1 == *.gz ]]; then gzip -dc; else cat; fi
@@ -742,24 +560,14 @@ verify_dumps() {
 
   log "verifying dumps in the latest snapshot"
 
-  # `latest` is resolved by restic against --host/--tag rather than parsed
-  # out of `restic snapshots --json`: no jq dependency and no output format
-  # to keep up with.
+  # `latest` is resolved by restic against --host/--tag.
   for c in $(printf '%s\n' "${!SQL_ENGINE[@]}" | sort); do
     path="$DUMP_DIR/$c.sql"
-    # What is on disk is the index of what to look for. A dump present here
-    # must be in the snapshot -- it was written before the backup ran and
-    # its live directory was excluded on the strength of it -- so restic
-    # failing to find it is not a missing file, it is the exclusion logic
-    # being wrong, which is exactly the class of bug this exists to catch.
+    # A dump on disk must be in the snapshot: its live directory was excluded.
     [[ -s $path ]] || continue
 
-    # PIPESTATUS is no help across a command substitution -- the pipeline
-    # runs in a subshell and the parent never sees its statuses -- so
-    # restic's own status comes back through a file. Telling "could not
-    # fetch it" apart from "it is corrupt" is the point of the branches
-    # below, and inferring it from empty output would file a zero-byte dump
-    # in the snapshot as a network problem.
+    # restic's own status via a file: PIPESTATUS does not cross a command
+    # substitution, and 'cannot fetch' must not read as 'corrupt'.
     tail_out=$( { restic "${filter[@]}" dump latest "$path" 2>"$errf"; echo $? >"$rcf"; } \
                 | tail -c 200 )
     rc=$(<"$rcf")
@@ -779,11 +587,8 @@ verify_dumps() {
     fi
   done
 
-  # Immich's own dump, which is the restore path for that database (see
-  # check_immich_dump above) and so the one worth checking hardest. One
-  # pass does both jobs: decompressing proves the archive is intact, the
-  # trailer proves the dump inside it is whole. The alternation covers
-  # pg_dump and pg_dumpall, which Immich has used at different versions.
+  # Immich's own dump: decompressing proves the archive, the trailer proves the
+  # dump. Matches both the pg_dump and pg_dumpall trailers.
   imm=$(find "$DATA/photos/backups" -type f -name 'immich-db-backup-*.sql*' ! -name '*.tmp' \
           -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
   if [[ -n $imm ]]; then
@@ -807,10 +612,7 @@ verify_dumps() {
     fi
   fi
 
-  # One restore of the whole subtree rather than a `restic dump` per file:
-  # 37 dumps would be 37 repository opens over sftp, and they are small
-  # enough that pulling all of them costs less than the round trips. They
-  # need a real file either way -- integrity_check cannot read a stream.
+  # One restore of the whole subtree: one repository open instead of ~40.
   if (( ${#SQLITE_DUMPED[@]} )); then
     if ! restic "${filter[@]}" restore latest --target "$VERIFY_TMP/sqlite" \
              --include "$DUMP_DIR/sqlite" >/dev/null 2>&1; then
@@ -837,14 +639,10 @@ verify_dumps() {
   fi
 
   if (( bad )); then
-    # Each one has already been reported by fail(); this says how much of
-    # the snapshot is affected. Not stamped, so it re-checks nightly until
-    # it is clean rather than going quiet for another interval.
+    # Not stamped, so it re-checks nightly until clean.
     warn "$bad dump(s) in the latest snapshot did not verify"
   elif (( unread )); then
-    # Deliberately not a failure and deliberately not stamped: an sftp
-    # hiccup is not a corrupt backup, but it must not buy another
-    # VERIFY_INTERVAL_DAYS of silence either.
+    # An sftp hiccup is not corruption, but must not buy another interval.
     warn "verification incomplete -- retrying on the next run"
   else
     log "verified $n dump(s) in the latest snapshot"
@@ -852,9 +650,7 @@ verify_dumps() {
   fi
 }
 
-# Same stamp-file reasoning as the repository check above: bmo is not
-# guaranteed to be powered on on any given day, so an interval measured
-# from the last success is the only schedule that actually happens.
+# Stamp-file interval, as for the repository check above.
 if [[ ${VERIFY_DUMPS:-1} != 1 ]]; then
   log "dump verification disabled (VERIFY_DUMPS=0)"
 else
@@ -873,12 +669,8 @@ else
   fi
 fi
 
-# Also the body of the success ping, so the monitor's last-received
-# message says what was stored rather than just "ok".
-#
-# `|| true` is not optional: this is a cosmetic read-back after the backup
-# has already succeeded, and without it a transient sftp error here would
-# end the run and fire a /fail ping at 03:30 about a backup that worked.
+# Also the success ping's body. `|| true`: a failed read-back here must not
+# turn a good backup into a /fail ping.
 SUMMARY=$(restic snapshots --host "$BACKUP_HOST" --tag "$BACKUP_TAG" --compact 2>/dev/null | tail -1 || true)
 [[ -n $SUMMARY ]] || SUMMARY="backup completed (could not read the snapshot list back)"
 log "$SUMMARY"

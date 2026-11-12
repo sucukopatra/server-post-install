@@ -1,7 +1,7 @@
 services:
   caddy:
     image: caddy-cloudflare:latest
-    build: /srv/docker/build/caddy
+    build: ../build/caddy
     container_name: caddy
     restart: unless-stopped
     ports:
