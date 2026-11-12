@@ -320,19 +320,19 @@ wait_ready() {
 #
 # tail -c rather than grep over the file: these run over dumps that can be
 # hundreds of megabytes, and the trailer is always the last line.
-valid_pg_dump() {
-  tail -c 200 "$1" | grep -q 'PostgreSQL database cluster dump complete'
+valid_postgres_dump() {
+  tail -c 200 | grep -q 'PostgreSQL database cluster dump complete'
 }
 
 valid_mariadb_dump() {
-  tail -c 200 "$1" | grep -q '^-- Dump completed'
+  tail -c 200 | grep -q '^-- Dump completed'
 }
 
 # Temp file and rename, so an interrupted dump cannot replace a good one
 # with a truncated one. stderr is left alone: when a dump fails, the
 # engine's own message in the journal is the only useful diagnosis.
 #
-# $validate is the name of a function taking the temp file; it runs before
+# $validate is the name of a function reading the temp file; it runs before
 # the rename, so a dump that fails it is discarded exactly like a dump
 # whose command exited non-zero, leaving the previous good copy in place.
 # That is the right direction -- a truncated dump is worse than yesterday's
@@ -341,7 +341,7 @@ valid_mariadb_dump() {
 # removing either one alone puts the silence back.
 dump_to() {
   local out=$1 validate=$2; shift 2
-  if "$@" > "$out.tmp" && [[ -s $out.tmp ]] && "$validate" "$out.tmp"; then
+  if "$@" > "$out.tmp" && [[ -s $out.tmp ]] && "$validate" < "$out.tmp"; then
     mv -f "$out.tmp" "$out"
     log "  dumped $(basename "$out") ($(du -h "$out" | cut -f1))"
     return 0
@@ -361,7 +361,7 @@ dump_postgres() {
     || warn "$container not ready after ${DB_READY_TIMEOUT}s -- dumping anyway"
   # The official image trusts local socket connections, so no credentials
   # are needed here.
-  dump_to "$DUMP_DIR/$container.sql" valid_pg_dump \
+  dump_to "$DUMP_DIR/$container.sql" valid_postgres_dump \
     docker exec "$container" sh -c 'exec pg_dumpall --clean --if-exists -U "$POSTGRES_USER"' \
     || fail "pg_dumpall failed or produced a truncated dump for $container"
 }
@@ -466,11 +466,11 @@ check_immich_dump() {
   # therefore reads as "no dump" -- a false alarm, which is the right way
   # for this particular check to be wrong.
   local pat='immich-db-backup-*.sql*'
-  newest=$(find "$dir" -type f -name "$pat" -newermt '-48 hours' -print -quit 2>/dev/null || true)
+  newest=$(find "$dir" -type f -name "$pat" ! -name '*.tmp' -newermt '-48 hours' -print -quit 2>/dev/null || true)
   if [[ -n $newest ]]; then
     log "  immich self-dump is current ($(basename "$newest"))"
   else
-    total=$(find "$dir" -type f -name "$pat" 2>/dev/null | wc -l || true)
+    total=$(find "$dir" -type f -name "$pat" ! -name '*.tmp' 2>/dev/null | wc -l || true)
     fail "no immich database dump under $dir in the last 48h ($total dump(s) total) -- check Immich's backup setting"
   fi
 }
@@ -734,11 +734,11 @@ decompress() {
 
 verify_dumps() {
   local -a filter=( --host "$BACKUP_HOST" --tag "$BACKUP_TAG" )
-  local c path pat tail_out rc imm db rel sdump
+  local c path tail_out rc gz imm db rel sdump
   local n=0 bad=0 unread=0
 
   VERIFY_TMP=$(mktemp -d)
-  local rcf="$VERIFY_TMP/rc"
+  local rcf="$VERIFY_TMP/rc" gzf="$VERIFY_TMP/gz" errf="$VERIFY_TMP/err"
 
   log "verifying dumps in the latest snapshot"
 
@@ -754,26 +754,23 @@ verify_dumps() {
     # being wrong, which is exactly the class of bug this exists to catch.
     [[ -s $path ]] || continue
 
-    case ${SQL_ENGINE[$c]} in
-      postgres) pat='PostgreSQL database cluster dump complete' ;;
-      mariadb)  pat='^-- Dump completed' ;;
-      *)        continue ;;
-    esac
-
     # PIPESTATUS is no help across a command substitution -- the pipeline
     # runs in a subshell and the parent never sees its statuses -- so
     # restic's own status comes back through a file. Telling "could not
     # fetch it" apart from "it is corrupt" is the point of the branches
     # below, and inferring it from empty output would file a zero-byte dump
     # in the snapshot as a network problem.
-    tail_out=$( { restic "${filter[@]}" dump latest "$path" 2>/dev/null; echo $? >"$rcf"; } \
+    tail_out=$( { restic "${filter[@]}" dump latest "$path" 2>"$errf"; echo $? >"$rcf"; } \
                 | tail -c 200 )
     rc=$(<"$rcf")
 
-    if (( rc != 0 )); then
+    if (( rc != 0 )) && grep -q 'not found' "$errf"; then
+      fail "$c.sql is on disk but missing from the latest snapshot -- the live database directory was excluded in its favour, so that database is in no copy at all"
+      bad=$(( bad + 1 ))
+    elif (( rc != 0 )); then
       warn "  $c.sql: could not be read back from the repository"
       unread=1
-    elif grep -q "$pat" <<< "$tail_out"; then
+    elif "valid_${SQL_ENGINE[$c]}_dump" <<< "$tail_out"; then
       log "  $c.sql: complete"
       n=$(( n + 1 ))
     else
@@ -787,17 +784,21 @@ verify_dumps() {
   # pass does both jobs: decompressing proves the archive is intact, the
   # trailer proves the dump inside it is whole. The alternation covers
   # pg_dump and pg_dumpall, which Immich has used at different versions.
-  imm=$(find "$DATA/photos/backups" -type f -name 'immich-db-backup-*.sql*' \
+  imm=$(find "$DATA/photos/backups" -type f -name 'immich-db-backup-*.sql*' ! -name '*.tmp' \
           -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
   if [[ -n $imm ]]; then
-    tail_out=$( { restic "${filter[@]}" dump latest "$imm" 2>/dev/null; echo $? >"$rcf"; } \
-                | decompress "$imm" 2>/dev/null | tail -c 200 )
-    rc=$(<"$rcf")
+    tail_out=$( { restic "${filter[@]}" dump latest "$imm" 2>"$errf"; echo $? >"$rcf"; } \
+                | { decompress "$imm" 2>/dev/null; echo $? >"$gzf"; cat >/dev/null; } \
+                | tail -c 200 )
+    rc=$(<"$rcf") gz=$(<"$gzf")
 
-    if (( rc != 0 )); then
+    if (( rc != 0 )) && grep -q 'not found' "$errf"; then
+      fail "$(basename "$imm") is on disk but missing from the latest snapshot -- this is Immich's restore path"
+      bad=$(( bad + 1 ))
+    elif (( rc != 0 )); then
       warn "  $(basename "$imm"): could not be read back from the repository"
       unread=1
-    elif grep -qE 'PostgreSQL database (cluster )?dump complete' <<< "$tail_out"; then
+    elif (( gz == 0 )) && grep -qE 'PostgreSQL database (cluster )?dump complete' <<< "$tail_out"; then
       log "  $(basename "$imm"): archive and dump both complete"
       n=$(( n + 1 ))
     else
@@ -811,11 +812,7 @@ verify_dumps() {
   # enough that pulling all of them costs less than the round trips. They
   # need a real file either way -- integrity_check cannot read a stream.
   if (( ${#SQLITE_DUMPED[@]} )); then
-    if ! command -v sqlite3 >/dev/null; then
-      # A skip, not a failure, matching how dump_sqlite already treats it.
-      warn "  sqlite3 not installed -- SQLite dumps in the snapshot not verified"
-      unread=1
-    elif ! restic "${filter[@]}" restore latest --target "$VERIFY_TMP/sqlite" \
+    if ! restic "${filter[@]}" restore latest --target "$VERIFY_TMP/sqlite" \
              --include "$DUMP_DIR/sqlite" >/dev/null 2>&1; then
       warn "  could not read the SQLite dumps back from the repository"
       unread=1
