@@ -1182,6 +1182,8 @@ if [[ $core_subnet =~ ^[0-9.]+/[0-9]+$ ]]; then
 
   sudo ufw allow from "$core_subnet" to any port 8384 proto tcp >/dev/null
   ok "syncthing GUI restricted to the core network ($core_subnet)"
+  sudo ufw allow from "$core_subnet" to any port 53 >/dev/null
+  ok "technitium DNS reachable from the core network (uptime-kuma)"
 else
   # Fails closed: silently falling back to the /12 because one docker
   # command did not answer is the wrong trade for an admin interface.
