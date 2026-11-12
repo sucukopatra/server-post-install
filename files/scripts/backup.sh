@@ -42,7 +42,7 @@ set -a
 . "$ENV_FILE"
 set +a
 
-for v in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE CONFIG DATA; do
+for v in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE CONFIG DATA BACKUP_HOST; do
   [[ -n ${!v:-} ]] || die "$v is unset in $ENV_FILE"
 done
 [[ -r $RESTIC_PASSWORD_FILE ]] || die "cannot read $RESTIC_PASSWORD_FILE"
@@ -97,49 +97,30 @@ export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
 # the `nas` host alias. systemd sets HOME, but a bare `sudo` may not.
 export HOME="${HOME:-/root}"
 
-# Scopes `forget` below, so it must stay stable across runs and across a
-# reinstall -- a renamed host otherwise starts a second snapshot history
-# whose retention never touches the first. run.sh pins it in $ENV_FILE.
-BACKUP_HOST="${BACKUP_HOST:-${HOSTNAME%%.*}}"
+BACKUP_TAG=bmo
 
-# Tested on the value: an empty /etc/hostname must not mean --host "".
-if [[ -z $BACKUP_HOST ]]; then
-  BACKUP_HOST=$(cat /etc/hostname 2>/dev/null || true)
-  BACKUP_HOST=${BACKUP_HOST//[[:space:]]/}
-fi
-[[ -n $BACKUP_HOST ]] || die "cannot determine hostname -- set BACKUP_HOST in $ENV_FILE"
-BACKUP_TAG="${BACKUP_TAG:-bmo}"
+KEEP_LAST=3
+KEEP_DAILY=7
+KEEP_WEEKLY=4
+KEEP_MONTHLY=6
 
-KEEP_LAST="${KEEP_LAST:-3}"
-KEEP_DAILY="${KEEP_DAILY:-7}"
-KEEP_WEEKLY="${KEEP_WEEKLY:-4}"
-KEEP_MONTHLY="${KEEP_MONTHLY:-6}"
-
-# How often `restic check` runs, in days. Metadata-only, but it walks the
-# whole index over sftp, which grows with the repository. 0 means every
-# run; RESTIC_CHECK=0 disables it outright.
-CHECK_INTERVAL_DAYS="${CHECK_INTERVAL_DAYS:-7}"
+# How often `restic check` runs, in days.
+CHECK_INTERVAL_DAYS=7
 
 # A dump not refreshed in this many days belongs to a service that no longer
 # runs. Generous: a stopped container's dump is the only copy of its database.
-DUMP_KEEP_DAYS="${DUMP_KEEP_DAYS:-30}"
+DUMP_KEEP_DAYS=30
 
 # How stale a dump may be before the run reports it, apart from deletion
 # above. Two nights, so one failure already made good is not reported.
-DUMP_STALE_HOURS="${DUMP_STALE_HOURS:-48}"
+DUMP_STALE_HOURS=48
 
 # How long to wait for a running database container to answer; on timeout
 # the dump is tried anyway.
-DB_READY_TIMEOUT="${DB_READY_TIMEOUT:-300}"
+DB_READY_TIMEOUT=300
 
-# How often the dumps are read back from the repository and validated, in
-# days. 0 means every run; VERIFY_DUMPS=0 disables it.
-VERIFY_INTERVAL_DAYS="${VERIFY_INTERVAL_DAYS:-7}"
-
-for v in CHECK_INTERVAL_DAYS DUMP_KEEP_DAYS DUMP_STALE_HOURS DB_READY_TIMEOUT \
-         VERIFY_INTERVAL_DAYS; do
-  [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number, got '${!v}'"
-done
+# How often the dumps are read back from the repository and validated, in days.
+VERIFY_INTERVAL_DAYS=7
 
 command -v restic >/dev/null || die "restic is not installed"
 
@@ -355,7 +336,7 @@ check_immich_dump() {
   local pat='immich-db-backup-*.sql*'
   newest=$(find "$dir" -type f -name "$pat" ! -name '*.tmp' -newermt '-48 hours' -print -quit 2>/dev/null || true)
   if [[ -n $newest ]]; then
-    log "  immich self-dump is current ($(basename "$newest"))"
+    log "  immich self-dump is current"
   else
     total=$(find "$dir" -type f -name "$pat" ! -name '*.tmp' 2>/dev/null | wc -l || true)
     fail "no immich database dump under $dir in the last 48h ($total dump(s) total) -- check Immich's backup setting"
@@ -438,7 +419,7 @@ exclude_sql_dirs() {
 
       # Existence is not freshness: a dump that keeps failing leaves an old copy in
       # place, and this is what says the snapshot no longer has a current one.
-      if [[ -z $(find "$DUMP_DIR/$c.sql" -newermt "-${DUMP_STALE_HOURS} hours" -print -quit 2>/dev/null) ]]; then
+      if running "$c" && [[ -z $(find "$DUMP_DIR/$c.sql" -newermt "-${DUMP_STALE_HOURS} hours" -print -quit 2>/dev/null) ]]; then
         fail "$DUMP_DIR/$c.sql has not been refreshed in ${DUMP_STALE_HOURS}h -- the snapshot excludes the live $live in favour of a stale dump"
       fi
     elif have_docker && running "$c"; then
@@ -518,38 +499,46 @@ fi
 # --host and --tag keep this to snapshots this script made: a repo shared
 # with another machine holds snapshots that are not ours to age out.
 log "applying retention (last=$KEEP_LAST daily=$KEEP_DAILY weekly=$KEEP_WEEKLY monthly=$KEEP_MONTHLY)"
-restic forget --prune \
-  --host "$BACKUP_HOST" \
-  --tag "$BACKUP_TAG" \
-  --keep-last    "$KEEP_LAST" \
-  --keep-daily   "$KEEP_DAILY" \
-  --keep-weekly  "$KEEP_WEEKLY" \
-  --keep-monthly "$KEEP_MONTHLY" \
-  || fail "restic forget/prune failed"
+FORGET=(--host "$BACKUP_HOST" --tag "$BACKUP_TAG"
+        --keep-last "$KEEP_LAST" --keep-daily "$KEEP_DAILY"
+        --keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY")
+restic forget --prune "${FORGET[@]}" || fail "restic forget/prune failed"
 
-# Structural check only. The interval runs from a stamp written on success,
-# since bmo is not always on; a failing repository is re-checked next run.
-if [[ ${RESTIC_CHECK:-1} != 1 ]]; then
-  log "repository check disabled (RESTIC_CHECK=0)"
-else
-  install -d -m 0700 "$STATE_DIR"
-  last_check=0
-  if [[ -r $CHECK_STAMP ]]; then
-    last_check=$(<"$CHECK_STAMP")
-    [[ $last_check =~ ^[0-9]+$ ]] || last_check=0
-  fi
-  since_days=$(( ( $(date +%s) - last_check ) / 86400 ))
-
-  if (( CHECK_INTERVAL_DAYS == 0 || since_days >= CHECK_INTERVAL_DAYS )); then
-    log "checking repository"
-    if restic check; then
-      date +%s > "$CHECK_STAMP"
-    else
-      fail "restic check reported problems"
-    fi
+if [[ -n ${OFFSITE_REPOSITORY:-} ]]; then
+  log "copying new snapshots to $OFFSITE_REPOSITORY"
+  restic -r "$OFFSITE_REPOSITORY" unlock >/dev/null 2>&1 || true
+  if restic -r "$OFFSITE_REPOSITORY" copy --from-repo "$RESTIC_REPOSITORY" \
+       --from-password-file "$RESTIC_PASSWORD_FILE" --host "$BACKUP_HOST" --tag "$BACKUP_TAG"; then
+    restic -r "$OFFSITE_REPOSITORY" forget --prune "${FORGET[@]}" \
+      || fail "restic forget/prune on $OFFSITE_REPOSITORY failed"
   else
-    log "repository checked ${since_days}d ago, next in $(( CHECK_INTERVAL_DAYS - since_days ))d"
+    fail "restic copy to $OFFSITE_REPOSITORY failed"
   fi
+fi
+
+# The interval runs from a stamp written on success, since bmo is not
+# always on; a failing repository is re-checked next run.
+install -d -m 0700 "$STATE_DIR"
+last_check=0
+if [[ -r $CHECK_STAMP ]]; then
+  last_check=$(<"$CHECK_STAMP")
+  [[ $last_check =~ ^[0-9]+$ ]] || last_check=0
+fi
+since_days=$(( ( $(date +%s) - last_check ) / 86400 ))
+
+if (( since_days >= CHECK_INTERVAL_DAYS )); then
+  log "checking repository and a random 5% of its data"
+  if restic check --read-data-subset=5%; then
+    date +%s > "$CHECK_STAMP"
+  else
+    fail "restic check reported problems"
+  fi
+  if [[ -n ${OFFSITE_REPOSITORY:-} ]]; then
+    restic -r "$OFFSITE_REPOSITORY" check --read-data-subset=5% \
+      || fail "restic check of $OFFSITE_REPOSITORY reported problems"
+  fi
+else
+  log "repository checked ${since_days}d ago, next in $(( CHECK_INTERVAL_DAYS - since_days ))d"
 fi
 
 # ------------------------------------------------------- verifying dumps
@@ -663,22 +652,17 @@ verify_dumps() {
 }
 
 # Stamp-file interval, as for the repository check above.
-if [[ ${VERIFY_DUMPS:-1} != 1 ]]; then
-  log "dump verification disabled (VERIFY_DUMPS=0)"
-else
-  install -d -m 0700 "$STATE_DIR"
-  last_verify=0
-  if [[ -r $VERIFY_STAMP ]]; then
-    last_verify=$(<"$VERIFY_STAMP")
-    [[ $last_verify =~ ^[0-9]+$ ]] || last_verify=0
-  fi
-  verify_days=$(( ( $(date +%s) - last_verify ) / 86400 ))
+last_verify=0
+if [[ -r $VERIFY_STAMP ]]; then
+  last_verify=$(<"$VERIFY_STAMP")
+  [[ $last_verify =~ ^[0-9]+$ ]] || last_verify=0
+fi
+verify_days=$(( ( $(date +%s) - last_verify ) / 86400 ))
 
-  if (( VERIFY_INTERVAL_DAYS == 0 || verify_days >= VERIFY_INTERVAL_DAYS )); then
-    verify_dumps
-  else
-    log "dumps verified ${verify_days}d ago, next in $(( VERIFY_INTERVAL_DAYS - verify_days ))d"
-  fi
+if (( verify_days >= VERIFY_INTERVAL_DAYS )); then
+  verify_dumps
+else
+  log "dumps verified ${verify_days}d ago, next in $(( VERIFY_INTERVAL_DAYS - verify_days ))d"
 fi
 
 # Also the success ping's body. `|| true`: a failed read-back here must not

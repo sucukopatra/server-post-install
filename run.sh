@@ -15,12 +15,6 @@
 
 set -euo pipefail
 
-# "${arr[@]}" on an empty array is an unbound-variable error before 4.4.
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
-  echo "bash 4.4 or newer is required (this is $BASH_VERSION)" >&2
-  exit 1
-fi
-
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE=""
 ASSUME_YES=0
@@ -734,15 +728,20 @@ if sudo test -f "$ENV_TARGET"; then
   ok "site.env values forced into $ENV_TARGET (${SITE_ENV_KEYS[*]})"
 fi
 
+dotenv_get() {
+  local v
+  v=$(sudo sed -n "s/^$1=//p" "$ENV_TARGET" 2>/dev/null | head -1 || true)
+  # Strip one layer of matched quotes, as compose does: KEY="" is empty.
+  if (( ${#v} >= 2 )) && [[ $v == \"*\" || $v == \'*\' ]]; then
+    v=${v:1:${#v}-2}
+  fi
+  printf '%s' "$v"
+}
+
 # HEALTHCHECK_URL is a capability, so it lives in sops, not in the committed
 # site.env.<host>. site.env still wins if set.
 if [[ -z ${HEALTHCHECK_URL:-} ]] && sudo test -f "$ENV_TARGET"; then
-  HEALTHCHECK_URL=$(sudo sed -n 's/^HEALTHCHECK_URL=//p' "$ENV_TARGET" | head -1)
-  # Strip one layer of matched quotes, as compose does: HEALTHCHECK_URL="" is empty.
-  if (( ${#HEALTHCHECK_URL} >= 2 )) \
-     && [[ $HEALTHCHECK_URL == \"*\" || $HEALTHCHECK_URL == \'*\' ]]; then
-    HEALTHCHECK_URL=${HEALTHCHECK_URL:1:${#HEALTHCHECK_URL}-2}
-  fi
+  HEALTHCHECK_URL=$(dotenv_get HEALTHCHECK_URL)
   [[ -n $HEALTHCHECK_URL ]] && ok "HEALTHCHECK_URL recovered from sops"
 fi
 export HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
@@ -1021,11 +1020,6 @@ step "Backups"
 RESTIC_PASS_FILE=/root/.restic-pass
 NAS_SSH_USER="${NAS_SSH_USER:-root}"
 
-# restic comes from config/packages.txt, so it is already installed here.
-command -v restic >/dev/null \
-  || die "restic is missing; it should have been installed in step 2"
-skip "restic present ($(restic version 2>/dev/null | awk '{print $2}'))"
-
 # root's SSH access to the NAS -- restic runs as root.
 sudo install -d -m 0700 /root/.ssh
 
@@ -1191,6 +1185,9 @@ if sudo test -f "$RESTIC_PASS_FILE"; then
     env_line DATA_IS_MOUNT        "${DATA_IS_MOUNT:-1}"
     env_line BACKUP_HOST          "$backup_host"
     env_line HEALTHCHECK_URL      "${HEALTHCHECK_URL:-}"
+    env_line OFFSITE_REPOSITORY   "${OFFSITE_REPO:-}"
+    env_line AWS_ACCESS_KEY_ID     "$(dotenv_get B2_KEY_ID)"
+    env_line AWS_SECRET_ACCESS_KEY "$(dotenv_get B2_APP_KEY)"
   } | sudo tee /etc/bmo-backup.env >/dev/null
   sudo chmod 600 /etc/bmo-backup.env
   ok "wrote /etc/bmo-backup.env (snapshots recorded as host '$backup_host')"

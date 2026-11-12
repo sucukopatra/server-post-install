@@ -94,6 +94,34 @@ Immich is the exception: it dumps its own database, version-aware, to
 shape of the host comes from this repository. A recovery needs all three of:
 this repo, the age private key, and the restic passphrase.
 
+### Off-site copy
+
+With `OFFSITE_REPO` set in `site.env`, each run ends by copying the new
+snapshots to that second repository (`restic copy`) and applying the same
+retention there; the weekly check covers it too. It uses the same restic
+passphrase.
+
+Set up once, for a Backblaze B2 bucket:
+
+1. Create a private bucket with the lifecycle rule "keep prior versions for
+   30 days".
+2. Create a key for that bucket **without `deleteFiles`**. bmo can then only
+   hide files, and anything hidden stays recoverable for 30 days. The web UI
+   cannot make such a key; the CLI can:
+   ```sh
+   uvx --from b2 b2 account authorize       # asks for the master key
+   uvx --from b2 b2 key create --bucket <bucket> bmo-restic listBuckets,listFiles,readFiles,writeFiles
+   ```
+3. Put the key in sops as `B2_KEY_ID` and `B2_APP_KEY`, run `run.sh --full`,
+   then create the repository by hand:
+   ```sh
+   sudo bash -c 'set -a; . /etc/bmo-backup.env; restic -r "$OFFSITE_REPOSITORY" init \
+     --from-repo "$RESTIC_REPOSITORY" --from-password-file "$RESTIC_PASSWORD_FILE" --copy-chunker-params'
+   ```
+
+If the NAS is lost, set `RESTIC_REPOSITORY` in `/etc/bmo-backup.env` to the
+`OFFSITE_REPOSITORY` value and use `bmo-restore` as usual.
+
 ### Monitoring
 
 Put a [healthchecks.io](https://healthchecks.io) ping URL (or one from your own

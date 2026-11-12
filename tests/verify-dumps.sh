@@ -99,6 +99,9 @@ RUNNING=pg check_excl "fresh dump excludes the live directory" 1 0
 setup; mkdir "$CONFIG/pg-live"; touch -d '-3 days' "$DUMP_DIR/pg.sql"
 RUNNING=pg check_excl "stale dump still excludes, and fails" 1 1
 
+setup; mkdir "$CONFIG/pg-live"; touch -d '-3 days' "$DUMP_DIR/pg.sql"
+check_excl "stopped engine's stale dump excludes, no failure" 1 0
+
 setup; mkdir "$CONFIG/pg-live"; rm "$DUMP_DIR/pg.sql"
 RUNNING=pg check_excl "running engine without a dump stays in, and fails" 0 1
 

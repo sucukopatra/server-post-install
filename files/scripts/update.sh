@@ -48,5 +48,6 @@ docker compose up -d --remove-orphans
 
 echo "==> Removing unused images..."
 docker image prune -f
+docker builder prune -f --filter until=168h
 echo "==> Done."
 exit "$rc"

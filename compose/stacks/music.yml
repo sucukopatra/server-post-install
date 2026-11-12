@@ -52,8 +52,6 @@ services:
     container_name: navidrome
     user: ${PUID}:${PGID}
     environment:
-      PUID: ${PUID}
-      PGID: ${PGID}
       TZ: ${TZ}
       ND_MUSICFOLDER: /data/media/music
       ND_DATAFOLDER: /config

@@ -43,12 +43,6 @@
 
 set -euo pipefail
 
-# "${arr[@]}" on an empty array is an unbound-variable error before 4.4.
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
-  echo "bash 4.4 or newer is required (this is $BASH_VERSION)" >&2
-  exit 1
-fi
-
 ENV_FILE=/etc/bmo-backup.env
 
 # ---------------------------------------------------------------- output
@@ -182,7 +176,7 @@ set -a
 . "$ENV_FILE"
 set +a
 
-for v in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE CONFIG DATA; do
+for v in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE CONFIG DATA BACKUP_HOST; do
   [[ -n ${!v:-} ]] || die "$v is unset in $ENV_FILE"
 done
 [[ -r $RESTIC_PASSWORD_FILE ]] || die "cannot read $RESTIC_PASSWORD_FILE"
@@ -192,8 +186,6 @@ export HOME="${HOME:-/root}"
 # Where compose.yml and the compose .env live. Falls back to the parent of
 # $CONFIG for an $ENV_FILE written by an older run.sh.
 DOCKER_ROOT="${DOCKER_ROOT:-$(dirname "$CONFIG")}"
-
-BACKUP_HOST="${BACKUP_HOST:-${HOSTNAME%%.*}}"
 
 # Same guard as backup.sh, for the same reason and then a worse one: with
 # the data disk missing, $DATA is an empty directory on the root
@@ -254,19 +246,6 @@ declare -A SVC_SQL=(
 )
 
 svc_containers() { printf '%s' "${SVC_CONTAINERS[$1]:-$1}"; }
-
-# Top-level *.sql names in the snapshot's _dumps, read once.
-SNAP_SQL_DUMPS=()
-
-# Engine dumps belonging to $1: <svc>.sql or <svc>[-_]*.sql, as backup.sh
-# names them. Globs, not a regex, so a service name cannot become a pattern.
-svc_sql_dumps() {
-  local svc=$1 d
-  for d in "${SNAP_SQL_DUMPS[@]}"; do
-    [[ $d == "$svc".sql || $d == "$svc"[-_]*.sql ]] && printf '%s\n' "$d"
-  done
-  return 0
-}
 
 # ------------------------------------------------------ engine readiness
 
@@ -491,8 +470,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mapfile -t SNAP_SQL_DUMPS < <(snap_sql_dumps "$SNAP")
-
 restored=(); sql_pending=()
 
 for svc in "${SERVICES[@]}"; do
@@ -592,22 +569,6 @@ for svc in "${SERVICES[@]}"; do
     skip "no SQLite dumps for $svc in $SNAP (it may not have a database)"
   fi
 
-  # ---- a SQL engine dump nothing here knows how to load ----
-  # A dump named after this service means its engine's data directory was
-  # excluded from the snapshot, so without an SVC_SQL arm it comes back empty.
-  if [[ -z ${SVC_SQL[$svc]:-} ]]; then
-    mapfile -t orphan_dumps < <(svc_sql_dumps "$svc")
-    if (( ${#orphan_dumps[@]} )); then
-      warn "snapshot $SNAP holds a SQL engine dump for $svc:"
-      printf '      %s\n' "${orphan_dumps[@]}"
-      warn "nothing here knows how to load it -- $svc has no SVC_SQL entry, and its"
-      warn "engine's data directory is excluded from the backup. $svc WILL START EMPTY."
-      # Not 'add it to SVC_SQL': the engine arms below are Immich's and RomM's only.
-      warn "Load it by hand before starting $svc -- this script only knows how to"
-      warn "load Immich's and RomM's engines, not this one."
-    fi
-  fi
-
   # ---- $DATA, where the service has any ----
   # In place with no rollback (too large to duplicate), so it asks first.
   if [[ -n ${SVC_DATA[$svc]:-} ]]; then
@@ -662,16 +623,6 @@ for svc in "${sql_pending[@]}"; do
 
   case ${SVC_SQL[$svc]} in
     postgres)
-      # This arm is Immich's end to end and never reads $svc, so any other
-      # service mapped to postgres is refused rather than loaded wrong.
-      if [[ $svc != immich ]]; then
-        warn "$svc is mapped to postgres in SVC_SQL, but this branch only knows Immich"
-        warn "-- it would load Immich's dump into Immich's engine, not $svc's."
-        warn "Refusing that. Load $svc's dump by hand from the snapshot's _dumps/,"
-        warn "then remove the SVC_SQL entry or teach this branch about $svc."
-        continue
-      fi
-
       # Immich's own scheduled dump handles the vectorchord extension; it is the
       # one to restore from.
       backup_dir="$DATA/photos/backups"
@@ -831,15 +782,6 @@ for svc in "${sql_pending[@]}"; do
       ;;
 
     mariadb)
-      # RomM's arm, as the postgres arm is Immich's.
-      if [[ $svc != romm ]]; then
-        warn "$svc is mapped to mariadb in SVC_SQL, but this branch only knows RomM"
-        warn "-- it would load romm-db.sql into romm-db, not $svc's database."
-        warn "Refusing that. Load $svc's dump by hand from the snapshot's _dumps/,"
-        warn "then remove the SVC_SQL entry or teach this branch about $svc."
-        continue
-      fi
-
       dump="$STAGE$CONFIG/_dumps/romm-db.sql"
       if [[ ! -f $dump ]] && ! (( DRY_RUN )); then
         # The per-service restore above only pulled _dumps/sqlite/<svc>.

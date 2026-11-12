@@ -26,7 +26,6 @@ services:
     # registration on a password manager. (The map syntax minecraft.yml uses is
     # the one where quoting is harmless.)
     - SIGNUPS_ALLOWED=false
-    - ADMIN_TOKEN=${VAULTWARDEN_ADMIN_TOKEN}
     - WEBSOCKET_ENABLED=true
     volumes:
     - ${CONFIG}/vaultwarden:/data
