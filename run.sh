@@ -4,9 +4,6 @@
 #
 #   ./run.sh --minimal    packages, docker, dirs, secrets, compose
 #   ./run.sh --full       the above plus NFS, systemd units, firewall, backups
-#   ./run.sh --full --restore
-#                         the above, then restore every service's state
-#                         from the newest snapshot (bare-metal rebuild)
 #
 #   -y, --yes             assume yes at every prompt (non-interactive)
 #
@@ -18,7 +15,6 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE=""
 ASSUME_YES=0
-RESTORE_REQUESTED=0
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
 c_blu=$'\033[34m'; c_dim=$'\033[2m';  c_off=$'\033[0m'
@@ -60,7 +56,6 @@ while (( $# )); do
         || die "--minimal and --full are mutually exclusive (got both)"
       PROFILE=$want ;;
     -y|--yes)  ASSUME_YES=1 ;;
-    --restore) RESTORE_REQUESTED=1 ;;
     -h|--help) usage 0 ;;
     *)         die "unknown option: $1 (try --help)" ;;
   esac
@@ -197,12 +192,6 @@ if [[ -z $PROFILE ]]; then
 fi
 [[ $PROFILE == minimal || $PROFILE == full ]] || die "profile must be 'minimal' or 'full'"
 ok "profile: $PROFILE"
-
-# Checked here rather than at the restore step, which --minimal exits long
-# before reaching: --restore would otherwise be silently ignored.
-if (( RESTORE_REQUESTED )) && [[ $PROFILE == minimal ]]; then
-  die "--restore needs --full (the restic repository is reconnected in the --full-only backup step)"
-fi
 
 if [[ $PROFILE == full ]]; then
   for v in NAS_HOST NAS_EXPORT LAN_SUBNET RESTIC_REPO; do
@@ -1139,29 +1128,9 @@ done
 # Is this host empty enough that a restore is what it wants? Not 'the
 # repository has snapshots' (true on every healthy host), but 'no regular
 # file under $CONFIG besides the Caddyfile this run renders'.
-snap_count=${snap_count:-0}
 config_state=""
 if sudo test -d "$CONFIG"; then
   config_state=$(sudo find "$CONFIG" -type f ! -path "$CADDYFILE" -print -quit 2>/dev/null || true)
-fi
-
-# Plausible, not decided: this only suppresses the "run a backup now"
-# offer and gates the restore step, which still needs an explicit
-# --restore or a y at the prompt.
-RESTORE_PLAUSIBLE=0
-if (( repo_ok && snap_count > 0 )); then
-  if (( RESTORE_REQUESTED )) || [[ -z $config_state ]]; then
-    RESTORE_PLAUSIBLE=1
-  fi
-fi
-
-# Fails before the backup offer below rather than at the restore step
-# after it: that offer can take an hour on a first run.
-if (( RESTORE_REQUESTED )); then
-  (( repo_ok )) \
-    || die "--restore was asked for but $RESTIC_REPO is not readable (see the errors above)"
-  (( snap_count > 0 )) \
-    || die "--restore was asked for but $RESTIC_REPO holds no snapshots yet"
 fi
 
 if sudo test -f "$RESTIC_PASS_FILE"; then
@@ -1221,9 +1190,9 @@ if sudo test -f "$RESTIC_PASS_FILE"; then
   sudo systemctl enable --now bmo-backup.timer >/dev/null
   ok "bmo-backup.timer enabled ($(systemctl show -p TimersCalendar --value bmo-backup.timer 2>/dev/null | head -1))"
 
-  # Installing the backup does not take one. Not offered under --yes, nor when
-  # a restore is likely: a snapshot of an empty host would top --list.
-  if (( repo_ok )) && ! (( RESTORE_PLAUSIBLE )); then
+  # Installing the backup does not take one. Not offered under --yes, nor on
+  # an empty host, which bmo-backup refuses to record.
+  if (( repo_ok )) && [[ -n $config_state ]]; then
     if (( ASSUME_YES )); then
       warn "no backup has been taken yet -- run: sudo /usr/local/sbin/bmo-backup"
     elif prompt_yn "run a backup now (can take a long time on the first run)?"; then
@@ -1232,58 +1201,7 @@ if sudo test -f "$RESTIC_PASS_FILE"; then
       skip "no backup taken -- run: sudo /usr/local/sbin/bmo-backup"
     fi
   elif (( repo_ok )); then
-    skip "not offering a backup yet -- restore comes first, see below"
-  fi
-fi
-
-# Restore before the stack ever starts: a service started on an empty
-# directory writes a fresh database there. Never automatic.
-
-step "Restore"
-
-if (( ! repo_ok )); then
-  skip "repository not readable -- nothing to restore from"
-
-elif (( snap_count == 0 )); then
-  skip "repository holds no snapshots yet -- nothing to restore from"
-
-else
-  do_restore=0
-  if (( RESTORE_REQUESTED )); then
-    do_restore=1
-    ok "--restore given ($snap_count snapshots available)"
-
-  elif [[ -n $config_state ]]; then
-    # The normal case: re-running run.sh on a working host. Nothing here
-    # should read as an invitation.
-    skip "$CONFIG already holds service state -- not touching it"
-    skip "to recover individual services: sudo /usr/local/sbin/bmo-restore --list"
-
-  elif (( ASSUME_YES )); then
-    # --yes means "do not ask", not "assume yes to replacing the disk".
-    warn "$CONFIG is empty and $snap_count snapshots exist, but --yes will not restore on its own"
-    warn "re-run with --restore, or: sudo /usr/local/sbin/bmo-restore --all"
-
-  else
-    echo
-    echo "  $CONFIG holds no service state, and $RESTIC_REPO has $snap_count snapshots."
-    echo "  This looks like a rebuilt host. Restoring now -- before the stack is"
-    echo "  started for the first time -- is the point at which it is cheapest:"
-    echo "  no service has yet written an empty database over its own directory."
-    echo
-    prompt_yn "restore every service from the newest snapshot?" && do_restore=1
-    (( do_restore )) || skip "not restoring -- sudo /usr/local/sbin/bmo-restore --all does it later"
-  fi
-
-  if (( do_restore )); then
-    # Handed off rather than reimplemented: this is the same code path a
-    # hand-run recovery takes, which is the only way it stays tested. Not
-    # passing -y, because it prompts before restoring $DATA -- tens of
-    # gigabytes of photo library, and the one part worth confirming.
-    echo
-    sudo /usr/local/sbin/bmo-restore --all \
-      || die "restore failed -- do NOT start the stack; investigate, then: sudo /usr/local/sbin/bmo-restore --all"
-    ok "restore finished -- review the output above before starting the stack"
+    skip "not offering a backup yet -- $CONFIG holds no service state"
   fi
 fi
 
@@ -1311,7 +1229,7 @@ Not done by this script, on purpose:
   - tailscale up  (needs interactive auth)
 EOF
 
-if (( RESTORE_PLAUSIBLE )) && (( ! RESTORE_REQUESTED )); then
+if [[ -z $config_state ]] && (( ${snap_count:-0} > 0 )); then
   cat <<'HINT'
 
 This host has no service state and the repository has snapshots. If this

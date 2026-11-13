@@ -196,31 +196,10 @@ Two things it deliberately does not do:
   judgement, not an assertion.
 
 After a full rebuild the order is: `run.sh --full` first (it makes the host),
-then `bmo-restore --all` (it makes the state). `run.sh` will offer to do the
-second step for you — see below.
-
-### Restoring as part of provisioning
-
-`run.sh --full` has a **Restore** phase between backups and verification. It
-sits there because that is the last moment a restore is cheap: the repository is
-reachable, `$CONFIG` exists with the right ownership, and no container has
-started yet. Start the stack first and every service initialises itself, writing
-an empty database into the directory its real one belongs in — nothing fails,
-they simply come up looking reset, and the next nightly backup snapshots that
-over the top.
-
-```sh
-./run.sh --full --restore     # provision, then restore everything
-```
-
-Without `--restore` it decides by looking at the host, and **not** at whether
-snapshots exist — snapshots existing describes the repository, not this machine.
-If `$CONFIG` already holds service state it says so and does nothing, on every
-run, for ever. If `$CONFIG` is empty and the repository has snapshots, it
-explains the situation and asks, defaulting to no.
-
-`--yes` will not restore on its own. It means "do not ask me", which is not the
-same as "yes, replace the disk".
+then `bmo-restore --all` (it makes the state), and only then `docker compose up
+-d`. A service started on an empty directory writes a fresh database there and
+comes up looking reset. Until the restore, the nightly backup refuses to run:
+`$CONFIG` holds no service state yet.
 
 ### Rollbacks
 

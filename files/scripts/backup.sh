@@ -146,8 +146,8 @@ if [[ ${DATA_IS_MOUNT:-1} == 1 ]] && ! mountpoint -q "$DATA"; then
 fi
 
 # Same reasoning, cruder: a wiped or not-yet-populated config tree.
-if [[ -z $(find "$CONFIG" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
-  die "$CONFIG is empty -- refusing to record that as a backup"
+if [[ -z $(find "$CONFIG" -type f ! -path "$CONFIG/caddy/Caddyfile" ! -path "$CONFIG/_dumps/*" -print -quit) ]]; then
+  die "$CONFIG holds no service state -- restore first (bmo-restore --all); refusing to record an empty host"
 fi
 
 # A killed run (reboot, OOM) leaves a lock behind. `unlock` without
@@ -516,15 +516,17 @@ if [[ -n ${OFFSITE_REPOSITORY:-} ]]; then
   fi
 fi
 
+stamp_age_days() {
+  local s=0
+  [[ -r $1 ]] && s=$(<"$1")
+  [[ $s =~ ^[0-9]+$ ]] || s=0
+  echo $(( ( $(date +%s) - s ) / 86400 ))
+}
+
 # The interval runs from a stamp written on success, since bmo is not
 # always on; a failing repository is re-checked next run.
 install -d -m 0700 "$STATE_DIR"
-last_check=0
-if [[ -r $CHECK_STAMP ]]; then
-  last_check=$(<"$CHECK_STAMP")
-  [[ $last_check =~ ^[0-9]+$ ]] || last_check=0
-fi
-since_days=$(( ( $(date +%s) - last_check ) / 86400 ))
+since_days=$(stamp_age_days "$CHECK_STAMP")
 
 if (( since_days >= CHECK_INTERVAL_DAYS )); then
   log "checking repository and a random 5% of its data"
@@ -652,12 +654,7 @@ verify_dumps() {
 }
 
 # Stamp-file interval, as for the repository check above.
-last_verify=0
-if [[ -r $VERIFY_STAMP ]]; then
-  last_verify=$(<"$VERIFY_STAMP")
-  [[ $last_verify =~ ^[0-9]+$ ]] || last_verify=0
-fi
-verify_days=$(( ( $(date +%s) - last_verify ) / 86400 ))
+verify_days=$(stamp_age_days "$VERIFY_STAMP")
 
 if (( verify_days >= VERIFY_INTERVAL_DAYS )); then
   verify_dumps
