@@ -353,6 +353,14 @@ else
   skip "/etc/docker/daemon.json already sets container DNS"
 fi
 
+# The backup and update timers run on host time, which the installer picked.
+if [[ $(timedatectl show -p Timezone --value 2>/dev/null) != "$TZ" ]]; then
+  sudo timedatectl set-timezone "$TZ"
+  ok "host timezone set to $TZ"
+else
+  skip "host timezone already $TZ"
+fi
+
 sudo systemctl enable --now docker >/dev/null
 ok "docker service enabled"
 
@@ -1182,7 +1190,8 @@ ${c_grn}Provisioning complete.${c_off}
 Not done by this script, on purpose:
   - restic init  (a new repo must be created by hand -- see above)
   - sudo tailscale up --advertise-exit-node --advertise-routes=$LAN_SUBNET  (interactive auth;
-    on a rebuild, delete the old node in the Tailscale admin console first)
+    on a rebuild, delete the old node in the Tailscale admin console first),
+    then: sudo tailscale set --auto-update --operator=\$USER
 EOF
 
 if [[ -z $config_state ]] && (( ${snap_count:-0} > 0 )); then

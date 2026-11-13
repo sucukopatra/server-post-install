@@ -36,6 +36,7 @@ taken. Then:
 
 ```sh
 sudo tailscale up --advertise-exit-node --advertise-routes=<LAN_SUBNET>   # interactive
+sudo tailscale set --auto-update --operator=$USER
 sudo bmo-restore --all                     # rebuild only: before the stack starts, see Restore
 cd /srv/docker && docker compose up -d     # rebuilds caddy via xcaddy, minutes
 ```
@@ -46,7 +47,7 @@ the new one.
 
 ## On a freshly installed Debian
 
-`run.sh` runs as your user through sudo, and `git` fetches it. As root:
+`run.sh` runs as your user through sudo, and `git` fetches it. As root (`su -`):
 
 ```sh
 apt install sudo git && usermod -aG sudo <user>   # then log out and back in
