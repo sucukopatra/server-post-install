@@ -301,6 +301,14 @@ else
   skip "Tailscale repository already present"
 fi
 
+if ! grep -rqs "${APT_CODENAME}-backports" /etc/apt/sources.list /etc/apt/sources.list.d/; then
+  echo "deb http://deb.debian.org/debian ${APT_CODENAME}-backports main" \
+    | sudo tee /etc/apt/sources.list.d/backports.list >/dev/null
+  ok "Debian backports added ($APT_CODENAME-backports, for cockpit-files)"
+else
+  skip "Debian backports already present"
+fi
+
 step "Packages"
 
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "$REPO_DIR/config/packages.txt")
@@ -464,7 +472,7 @@ if [[ -n ${DATA_UUID:-} ]] && ! findmnt -sn -M "$DATA" >/dev/null; then
   data_fs=$(lsblk -no FSTYPE "/dev/disk/by-uuid/$DATA_UUID" 2>/dev/null || true)
   [[ -n $data_fs ]] || die "no filesystem with UUID $DATA_UUID (DATA_UUID in site.env) -- is the data disk attached?"
   sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
-  echo "UUID=$DATA_UUID $DATA $data_fs defaults,noatime 0 2" | sudo tee -a /etc/fstab >/dev/null
+  echo "UUID=$DATA_UUID $DATA $data_fs defaults,noatime,nofail 0 2" | sudo tee -a /etc/fstab >/dev/null
   sudo systemctl daemon-reload
   sudo mkdir -p "$DATA"
   sudo mount "$DATA"
@@ -1173,7 +1181,8 @@ ${c_grn}Provisioning complete.${c_off}
 
 Not done by this script, on purpose:
   - restic init  (a new repo must be created by hand -- see above)
-  - sudo tailscale up --advertise-exit-node --advertise-routes=$LAN_SUBNET  (interactive auth)
+  - sudo tailscale up --advertise-exit-node --advertise-routes=$LAN_SUBNET  (interactive auth;
+    on a rebuild, delete the old node in the Tailscale admin console first)
 EOF
 
 if [[ -z $config_state ]] && (( ${snap_count:-0} > 0 )); then

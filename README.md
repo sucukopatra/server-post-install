@@ -30,7 +30,9 @@ each. Both are stored 0600 and skipped on later runs. A wrong age key stops the
 run before anything is stored; a restic passphrase that cannot open the
 repository is reported, and `sudo rm /root/.restic-pass` lets you enter it again.
 
-Afterwards:
+Afterwards, on a rebuild, first delete the old node in the Tailscale admin
+console. While it exists the new node is named `bmo-1`, and the old IP stays
+taken. Then:
 
 ```sh
 sudo tailscale up --advertise-exit-node --advertise-routes=<LAN_SUBNET>   # interactive
@@ -38,9 +40,9 @@ sudo bmo-restore --all                     # rebuild only: before the stack star
 cd /srv/docker && docker compose up -d     # rebuilds caddy via xcaddy, minutes
 ```
 
-A new tailscale node gets a new IP. In the admin console, delete the old node,
-approve the new one's exit node and route, and either give it the old IP back
-or point the tailnet's split-DNS entry for `DOMAIN` at the new one.
+In the admin console, approve the new node's exit node and route, and either
+give it the old IP back or point the tailnet's split-DNS entry for `DOMAIN` at
+the new one.
 
 ## On a freshly installed Debian
 
@@ -218,8 +220,9 @@ re-run `run.sh --full` once the stack is up to enable it.
 ### Rollbacks
 
 Restoring over an existing directory saves the old one first; restoring into
-empty space does not, and no rollback directory is left behind in that case —
-which is the normal shape of a bare-metal rebuild.
+empty space does not. On a rebuild the rollback holds only the empty
+directories and the Caddyfile that `run.sh` created: delete it, never undo to
+it.
 
 Use `--dry-run` first. It prints every action, including which SQLite databases
 it would put back over which paths, and changes nothing.

@@ -739,6 +739,10 @@ for svc in "${sql_pending[@]}"; do
       ;;
 
     mariadb)
+      if ! (( DRY_RUN )) && [[ -d $CONFIG/romm/mysql ]]; then
+        ok "RomM's data directory came back as files (romm-db was stopped at backup time) -- nothing to load"
+        continue
+      fi
       dump="$STAGE$CONFIG/_dumps/romm-db.sql"
       if [[ ! -f $dump ]] && ! (( DRY_RUN )); then
         # The per-service restore above only pulled _dumps/sqlite/<svc>.
@@ -811,12 +815,15 @@ if [[ -s ${MANIFEST:-/dev/null} ]]; then
   To put it back:
     bmo-restore --undo $STAMP
 
+  After a rebuild it holds only the empty directories run.sh created:
+  delete it, do not undo to it.
+
   Delete it once you are satisfied -- it is outside \$CONFIG so it is not
   in any snapshot, but it is still using disk:
     rm -rf $ROLLBACK
 EOF
 else
-  # Restored into empty space, as every bare-metal restore is: nothing to undo.
+  # Restored into empty space: nothing to undo.
   discard_empty_rollback "nothing was overwritten, so there is no rollback to keep"
 fi
 

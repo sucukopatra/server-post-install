@@ -15,7 +15,6 @@ wget
 zip
 # `unrar` is in non-free, which run.sh enables.
 unrar
-unrar-free
 bash-completion
 ncdu
 restic
