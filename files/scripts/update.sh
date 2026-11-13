@@ -28,12 +28,15 @@ fi
 # which is a mountpoint whether or not the export behind it is attached.
 # Stat'ing a path inside the export triggers the mount and reports the truth
 # (bounded by DefaultTimeoutStartSec when the NAS is down).
-if grep -qs "[[:space:]]${NAS}[[:space:]]" /etc/fstab && [[ ! -d "$NAS/media" ]]; then
-  echo "ERROR: $NAS has an fstab entry but $NAS/media is not there." >&2
-  echo "       Refusing to update the stack -- the NAS-backed containers bind" >&2
-  echo "       paths inside the export and would fail to start. Leaving the" >&2
-  echo "       running stack alone. Mount the export and re-run." >&2
-  exit 1
+if grep -qs "[[:space:]]${NAS}[[:space:]]" /etc/fstab; then
+  for _ in {1..30}; do [[ -d "$NAS/media" ]] && break; sleep 60; done
+  if [[ ! -d "$NAS/media" ]]; then
+    echo "ERROR: $NAS has an fstab entry but $NAS/media did not appear in 30 tries." >&2
+    echo "       Refusing to update the stack -- the NAS-backed containers bind" >&2
+    echo "       paths inside the export and would fail to start. Leaving the" >&2
+    echo "       running stack alone. Mount the export and re-run." >&2
+    exit 1
+  fi
 fi
 
 # The slow, failure-prone steps run while the stack is still up.

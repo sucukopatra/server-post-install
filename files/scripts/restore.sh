@@ -606,18 +606,6 @@ dump_stream() {
   if [[ $1 == *.gz ]]; then gunzip -c "$1"; else cat "$1"; fi
 }
 
-# One key from the compose .env, read rather than sourcing every secret.
-# Strips one layer of matched quotes, as compose does.
-env_value() {
-  local key=$1 file="$DOCKER_ROOT/.env" val
-  [[ -r $file ]] || return 0
-  val=$(sed -n "s/^${key}=//p" "$file" | head -1)
-  if (( ${#val} >= 2 )) && [[ $val == \"*\" || $val == \'*\' ]]; then
-    val=${val:1:${#val}-2}
-  fi
-  printf '%s\n' "$val"
-}
-
 for svc in "${sql_pending[@]}"; do
   step "$svc database"
 
@@ -657,13 +645,12 @@ for svc in "${sql_pending[@]}"; do
       fi
 
       # Only the PostgreSQL major version is checkable: a newer dump does not
-      # reliably load into an older server. The Immich version is shown for a
-      # human to judge. dump_is_cluster is set once the header has been read.
+      # reliably load into an older server. The Immich version is in the dump's
+      # name, shown above. dump_is_cluster is set once the header has been read.
       dump_is_cluster=0
 
       if (( DRY_RUN )); then
-        skip "would compare the dump's PostgreSQL major version against the running server,"
-        skip "and probe psql for \\restrict support if the dump's header uses it"
+        skip "would compare the dump's PostgreSQL major version against the running server"
       else
         # The header, read once into a variable. `head` on a live pipe kills gunzip
         # with SIGPIPE, which pipefail turns into a failed test.
@@ -671,40 +658,15 @@ for svc in "${sql_pending[@]}"; do
         dump_major=$(pg_major <<<"$dump_head" || true)
         live_ver_raw=$(docker exec immich_postgres postgres --version 2>/dev/null || true)
         live_major=$(grep -oE '[0-9]+' <<<"$live_ver_raw" | head -1 || true)
-        live_full=$(grep -oE '[0-9]+\.[0-9]+' <<<"$live_ver_raw" | head -1 || true)
         if [[ -n $dump_major && -n $live_major ]]; then
           if (( dump_major > live_major )); then
             warn "the dump was written by PostgreSQL $dump_major; this server is $live_major"
-            warn "if you pin the image back, pin it to the NEWEST $dump_major.x, not to $dump_major itself --"
-            warn "see the \\restrict check below for what an old patch release costs you."
             die "refusing to load a newer dump into an older server -- pin the image back to $dump_major"
           fi
           ok "dump PostgreSQL $dump_major into server $live_major -- compatible"
         else
           warn "could not read a version from the dump or the server (dump='$dump_major' server='$live_major')"
           prompt_yn "load it anyway?" || { skip "left the Immich database empty"; continue; }
-        fi
-
-        # Dumps from the August 2025 minor releases on open with \restrict
-        # (CVE-2025-8714); an older psql aborts on it under ON_ERROR_STOP. Ask psql
-        # rather than keep a table of minimum versions. Not fatal: romm may follow.
-        if grep -q '^\\restrict' <<<"$dump_head"; then
-          # shellcheck disable=SC2016
-          if docker exec immich_postgres sh -c \
-               'exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres \
-                  -c "\restrict bmoprobe" -c "\unrestrict bmoprobe"' \
-               >/dev/null 2>&1; then
-            ok "psql understands \\restrict -- this dump's header will load"
-          else
-            warn "this dump opens with \\restrict, and the psql in immich_postgres"
-            warn "(PostgreSQL ${live_full:-$live_major}) does not understand it."
-            warn "ON_ERROR_STOP=1 would abort on that line, before any data loads."
-            warn "\\restrict arrived in the August 2025 minor releases -- pin the"
-            warn "postgres image forward to the newest ${live_major}.x and re-run:"
-            warn "  bmo-restore immich"
-            skip "left the Immich database empty; $newest is untouched"
-            continue
-          fi
         fi
 
         # A pg_dumpall (cluster) must load via the `postgres` database, a pg_dump
@@ -717,11 +679,6 @@ for svc in "${sql_pending[@]}"; do
           dump_is_cluster=0
           ok "dump is a single-database dump (pg_dump) -- loading into \$POSTGRES_DB"
         fi
-
-        # From $DOCKER_ROOT/.env, where compose gets it.
-        immich_ver=$(env_value IMMICH_VERSION)
-        warn "IMMICH_VERSION pinned in $DOCKER_ROOT/.env: ${immich_ver:-<unset>}"
-        warn "-- check the release notes if that is far from the version that wrote this dump."
       fi
 
       if (( DRY_RUN )); then

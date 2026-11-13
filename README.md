@@ -26,7 +26,9 @@ its settings back.
 | `-y` | skip confirmations (not the two secret prompts) |
 
 It will ask for your **age private key** and your **restic passphrase**, once
-each. Both are stored 0600 and skipped on later runs.
+each. Both are stored 0600 and skipped on later runs. A wrong age key stops the
+run before anything is stored; a restic passphrase that cannot open the
+repository is reported, and `sudo rm /root/.restic-pass` lets you enter it again.
 
 Afterwards:
 
@@ -190,16 +192,17 @@ Two things it deliberately does not do:
   that free before the restore could start. That half is not undoable.
 - **The Immich database is checked before it is loaded.** The script compares
   the PostgreSQL major version recorded in the dump against the running server
-  and refuses to load a newer dump into an older one. It also prints the pinned
-  `IMMICH_VERSION` for you to sanity-check, because the Immich *application*
-  version is not recorded in the dump in any stable form — that part is a
-  judgement, not an assertion.
+  and refuses to load a newer dump into an older one. The dump's file name
+  shows the Immich version that wrote it, for you to compare with the one you
+  run.
 
 After a full rebuild the order is: `run.sh --full` first (it makes the host),
 then `bmo-restore --all` (it makes the state), and only then `docker compose up
 -d`. A service started on an empty directory writes a fresh database there and
 comes up looking reset. Until the restore, the nightly backup refuses to run:
-`$CONFIG` holds no service state yet.
+`$CONFIG` holds no service state yet. For the same reason `run.sh` leaves
+`docker-update.timer` off on such a host, since its boot run starts the stack;
+re-run `run.sh --full` once the stack is up to enable it.
 
 ### Rollbacks
 

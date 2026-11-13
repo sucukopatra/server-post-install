@@ -558,33 +558,9 @@ fi
 
 KEY_FILE="$HOME/.config/sops/age/keys.txt"
 
-# Declared before the decryption loop, which names it in a die() message:
-# assigned further down it hits `set -u` first, and the run reports an
-# unbound variable instead of what actually went wrong.
+# Declared before decryption, which names it in a die() message: assigned
+# further down it hits `set -u` first.
 ENV_TARGET="$DOCKER_ROOT/.env"
-
-# Both secret prompts -- this and the restic passphrase below -- verify
-# rather than gate on the file existing, so one wrong entry is not permanent
-# and a candidate that does not work never overwrites one that might.
-
-# The format check catches a paste of all three lines age-keygen prints:
-# `read` takes only the first, a comment, and sops then fails much later
-# with an unrelated-looking decryption error.
-read_age_key() {
-  local dst=$1 key
-  echo
-  echo "  Paste your age private key -- one line, starts with AGE-SECRET-KEY-1."
-  echo "  (age-keygen prints two '#' comment lines above it; skip those.)"
-  echo "  Leave blank to skip decryption and write a template .env instead."
-  read -rsp "  key: " key; echo
-  [[ -n $key ]] || return 1
-  if [[ $key != AGE-SECRET-KEY-1* ]]; then
-    warn "that does not start with AGE-SECRET-KEY-1 -- looks like a comment line or a public key"
-    return 2
-  fi
-  printf '%s\n' "$key" > "$dst"
-  unset key
-}
 
 # Held in a temp file because piping sops into `tee "$ENV_TARGET"` truncates
 # the target as the pipeline starts, so a wrong key would destroy a working
@@ -592,80 +568,42 @@ read_age_key() {
 DECRYPTED=""
 
 if [[ -f $REPO_DIR/secrets/env.sops ]]; then
-  key_candidate=""; promote=0; attempt=0
-  [[ -f $KEY_FILE ]] && key_candidate=$KEY_FILE
-
-  while (( ++attempt <= 3 )); do
-    if [[ -z $key_candidate ]]; then
-      key_candidate=$(mktemp); chmod 600 "$key_candidate"; cleanup_add "$key_candidate"
-      # `|| rc=$?`: under set -e a bare call would die before rc is read.
-      rc=0; read_age_key "$key_candidate" || rc=$?
-      if (( rc == 2 )); then                       # bad format, offer another
-        rm -f "$key_candidate"; key_candidate=""
-        (( ASSUME_YES )) && { warn "--yes cannot re-prompt -- secrets will not be decrypted"; break; }
-        prompt_yn "try again?" && continue
-        break
-      elif (( rc != 0 )); then                     # blank: deliberate skip
-        rm -f "$key_candidate"; key_candidate=""
-        warn "no key provided -- secrets will not be decrypted"
-        break
-      fi
-      promote=1
+  key=$KEY_FILE
+  if [[ ! -f $KEY_FILE ]]; then
+    echo
+    echo "  Paste your age private key -- one line, starts with AGE-SECRET-KEY-1."
+    echo "  (age-keygen prints two '#' comment lines above it; skip those.)"
+    echo "  Leave blank to skip decryption and write a template .env instead."
+    read -rsp "  key: " pasted; echo
+    if [[ -n $pasted ]]; then
+      # A pasted comment line or public key would otherwise fail later as an
+      # unrelated-looking decryption error.
+      [[ $pasted == AGE-SECRET-KEY-1* ]] \
+        || die "that does not start with AGE-SECRET-KEY-1 -- a comment line or the public key? Re-run and paste the key line"
+      key=$(mktemp); chmod 600 "$key"; cleanup_add "$key"
+      printf '%s\n' "$pasted" > "$key"
     fi
+    unset pasted
+  fi
 
+  if [[ -f $key ]]; then
     # --input-type/--output-type are required: sops does not recognise .sops.
     out=$(mktemp); chmod 600 "$out"; cleanup_add "$out"
-    sops_err=$(mktemp); cleanup_add "$sops_err"
-    if SOPS_AGE_KEY_FILE="$key_candidate" \
-       sops -d --input-type dotenv --output-type dotenv \
-         "$REPO_DIR/secrets/env.sops" > "$out" 2>"$sops_err"; then
-      rm -f "$sops_err"
-      if [[ -s $out ]]; then
-        DECRYPTED=$out
-        if (( promote )); then
-          mkdir -p "$(dirname "$KEY_FILE")"
-          install -m 600 "$key_candidate" "$KEY_FILE"
-          rm -f "$key_candidate"
-          ok "age key stored at $KEY_FILE (0600)"
-        else
-          skip "age key present and decrypts secrets/env.sops"
-        fi
-        break
-      fi
-      # Empty after a clean decrypt is a truncated env.sops, not a key
-      # problem, so another key cannot help.
-      rm -f "$out"
-      (( promote )) && rm -f "$key_candidate"
-      warn "sops decrypted secrets/env.sops but produced nothing -- refusing to install an empty .env"
-      break
-    fi
-
-    rm -f "$out"
-
-    # Show what sops actually said -- discarding it makes every failure,
-    # the format one above included, look like a wrong key.
-    if grep -qiE 'unmarshal|input type|binary store|invalid character' "$sops_err" 2>/dev/null; then
-      warn "sops cannot read secrets/env.sops at all:"
-      sed 's/^/      /' "$sops_err" >&2
-      rm -f "$sops_err"
-      (( promote )) && rm -f "$key_candidate"
-      die "that is a file format problem, not a key problem -- no other key will help"
-    fi
-
-    warn "could not decrypt secrets/env.sops with that key"
-    [[ -s $sops_err ]] && sed 's/^/      /' "$sops_err" >&2
-    rm -f "$sops_err"
-    if (( promote )); then
-      rm -f "$key_candidate"                       # ours, and it did not work
+    SOPS_AGE_KEY_FILE=$key sops -d --input-type dotenv --output-type dotenv \
+        "$REPO_DIR/secrets/env.sops" > "$out" \
+      || die "could not decrypt secrets/env.sops (sops says why above); $ENV_TARGET left untouched. A wrong $KEY_FILE: move it aside and re-run"
+    [[ -s $out ]] || die "sops decrypted secrets/env.sops but produced nothing -- refusing to install an empty .env"
+    DECRYPTED=$out
+    if [[ $key != "$KEY_FILE" ]]; then
+      mkdir -p "$(dirname "$KEY_FILE")"
+      install -m 600 "$key" "$KEY_FILE"
+      ok "age key stored at $KEY_FILE (0600)"
     else
-      warn "$KEY_FILE is left exactly as it was -- it may unlock something else"
+      skip "age key present and decrypts secrets/env.sops"
     fi
-    key_candidate=""; promote=0
-
-    (( ASSUME_YES )) && die "wrong age key, and --yes cannot prompt for another ($ENV_TARGET left untouched)"
-    prompt_yn "enter a different age key?" || break
-  done
-  (( attempt > 3 )) && warn "giving up after 3 attempts -- secrets will not be decrypted"
+  else
+    warn "no key provided -- secrets will not be decrypted"
+  fi
 fi
 
 # The compose variables that come from site.env rather than sops. run.sh
@@ -928,7 +866,18 @@ sudo install -m 0644 "$REPO_DIR/files/systemd/docker-update.timer" \
   /etc/systemd/system/docker-update.timer
 sudo systemctl daemon-reload
 
-if prompt_yn "enable docker-update.timer (pulls latest images after boot and every Sunday)?"; then
+# Is this host empty enough that a restore is what it wants? Not 'the
+# repository has snapshots' (true on every healthy host), but 'no regular
+# file under $CONFIG besides the Caddyfile this run renders'.
+config_state=""
+if sudo test -d "$CONFIG"; then
+  config_state=$(sudo find "$CONFIG" -type f ! -path "$CADDYFILE" -print -quit 2>/dev/null || true)
+fi
+
+if [[ -z $config_state ]]; then
+  skip "docker-update.timer not enabled -- $CONFIG holds no service state, and its boot run would start the stack before a restore"
+  skip "re-run run.sh --full once the stack has state to enable it"
+elif prompt_yn "enable docker-update.timer (pulls latest images after boot and every Sunday)?"; then
   sudo systemctl enable docker-update.timer >/dev/null
   ok "docker-update.timer enabled"
 else
@@ -1046,91 +995,42 @@ else
   fi
 fi
 
-# Passphrase prompt and verification are one loop, as for the age key.
-#
-# $1 = password file. Prints the snapshot list as JSON; non-zero means the
-# repository could not be opened.
-restic_snapshots() {
-  sudo restic -r "$RESTIC_REPO" --password-file "$1" snapshots --json 2>/dev/null
-}
-
 repo_ok=0
-pass_candidate=""; promote=0; attempt=0
-sudo test -f "$RESTIC_PASS_FILE" && pass_candidate=$RESTIC_PASS_FILE
 
-while (( ++attempt <= 3 )); do
-  if [[ -z $pass_candidate ]]; then
-    echo
-    echo "  No working restic passphrase for $RESTIC_REPO"
-    echo "  Paste it from your paper / password-manager copy."
-    echo "  WITHOUT IT THE EXISTING BACKUPS CANNOT BE READ."
-    read -rsp "  passphrase: " restic_pass; echo
-    if [[ -z $restic_pass ]]; then
-      warn "no passphrase given -- backups not configured"
-      break
-    fi
+if ! sudo test -f "$RESTIC_PASS_FILE"; then
+  echo
+  echo "  No restic passphrase for $RESTIC_REPO"
+  echo "  Paste it from your paper / password-manager copy."
+  echo "  WITHOUT IT THE EXISTING BACKUPS CANNOT BE READ."
+  read -rsp "  passphrase (blank to skip backups): " restic_pass; echo
+  if [[ -n $restic_pass ]]; then
     # 0600 before the secret is written, not after: /root/.restic-pass is
     # all that stands between a stolen repository and every file here.
-    pass_candidate=$(mktemp); chmod 600 "$pass_candidate"; cleanup_add "$pass_candidate"
-    printf '%s\n' "$restic_pass" > "$pass_candidate"
-    unset restic_pass
-    promote=1
+    pass_tmp=$(mktemp); chmod 600 "$pass_tmp"; cleanup_add "$pass_tmp"
+    printf '%s\n' "$restic_pass" > "$pass_tmp"
+    sudo install -m 600 -o root -g root "$pass_tmp" "$RESTIC_PASS_FILE"
+    rm -f "$pass_tmp"
+    ok "passphrase stored at $RESTIC_PASS_FILE (0600)"
+  else
+    warn "no passphrase given -- backups not configured"
   fi
+  unset restic_pass
+fi
 
-  if snaps_json=$(restic_snapshots "$pass_candidate"); then
-    if (( promote )); then
-      sudo install -m 600 -o root -g root "$pass_candidate" "$RESTIC_PASS_FILE"
-      rm -f "$pass_candidate"
-      ok "passphrase stored at $RESTIC_PASS_FILE (0600)"
-    else
-      skip "restic passphrase present and opens the repository"
-    fi
+if sudo test -f "$RESTIC_PASS_FILE"; then
+  if snaps_json=$(sudo restic -r "$RESTIC_REPO" --password-file "$RESTIC_PASS_FILE" snapshots --json 2>/dev/null); then
     # One "short_id" per snapshot; "time" would also match fields restic
-    # may add later. Counted from the listing the open above already
-    # fetched.
-    snap_count=$(grep -c '"short_id"' <<<"$snaps_json" || true)
+    # may add later.
+    snap_count=$(grep -o '"short_id"' <<<"$snaps_json" | wc -l || true)
     ok "connected to $RESTIC_REPO ($snap_count snapshots)"
     repo_ok=1
-    break
-  fi
-
-  warn "could not read $RESTIC_REPO"
-  warn "wrong passphrase, no SSH access as root, or the repo does not exist yet."
-
-  # A brand-new repository is a real setup rather than a failure, and
-  # creating one by hand needs the passphrase on disk first -- so offer to
-  # keep an unverified one.
-  if (( promote )); then
-    if (( ASSUME_YES )); then
-      rm -f "$pass_candidate"
-      die "restic passphrase does not open $RESTIC_REPO, and --yes cannot prompt for another"
-    fi
-    if prompt_yn "store it anyway (needed if this repo does not exist yet and you will run restic init)?"; then
-      sudo install -m 600 -o root -g root "$pass_candidate" "$RESTIC_PASS_FILE"
-      rm -f "$pass_candidate"
-      warn "passphrase stored at $RESTIC_PASS_FILE but NOT verified against the repository"
-      warn "If this is a NEW repo, initialise it by hand -- deliberately not"
-      warn "automated, because init on a live repo orphans every snapshot:"
-      warn "  sudo restic -r $RESTIC_REPO --password-file $RESTIC_PASS_FILE init"
-      break
-    fi
-    rm -f "$pass_candidate"
   else
-    warn "$RESTIC_PASS_FILE is left exactly as it was"
-    (( ASSUME_YES )) && break
+    warn "could not read $RESTIC_REPO with $RESTIC_PASS_FILE:"
+    warn "wrong passphrase (sudo rm $RESTIC_PASS_FILE and re-run), no SSH access as root,"
+    warn "or the repo does not exist yet. A NEW repo is initialised by hand -- deliberately"
+    warn "not automated, because init on a live repo orphans every snapshot:"
+    warn "  sudo restic -r $RESTIC_REPO --password-file $RESTIC_PASS_FILE init"
   fi
-  pass_candidate=""; promote=0
-
-  prompt_yn "try a different passphrase?" || break
-done
-(( attempt > 3 )) && warn "giving up after 3 attempts -- backups not configured"
-
-# Is this host empty enough that a restore is what it wants? Not 'the
-# repository has snapshots' (true on every healthy host), but 'no regular
-# file under $CONFIG besides the Caddyfile this run renders'.
-config_state=""
-if sudo test -d "$CONFIG"; then
-  config_state=$(sudo find "$CONFIG" -type f ! -path "$CADDYFILE" -print -quit 2>/dev/null || true)
 fi
 
 if sudo test -f "$RESTIC_PASS_FILE"; then
@@ -1239,6 +1139,9 @@ nightly backup snapshots that over the top:
 
      sudo /usr/local/sbin/bmo-restore --list
      sudo /usr/local/sbin/bmo-restore --all
+
+Then start the stack and re-run ./run.sh --full, which enables
+docker-update.timer now that there is state to protect.
 HINT
 fi
 
