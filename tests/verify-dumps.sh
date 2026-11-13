@@ -6,7 +6,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # shellcheck source=/dev/null
-source <(sed -n '/^\(decompress\|verify_dumps\|exclude_sql_dirs\|dump_sqlite\|valid_[a-z]*_dump\)() {/,/^}/p' "$src")
+source <(sed -n '/^\(decompress\|verify_dumps\|exclude_sql_dirs\|dump_sqlite\|has_state\|valid_[a-z]*_dump\)() {/,/^}/p' "$src")
 
 log()  { :; }
 warn() { WARNS+=("$*"); }
@@ -119,5 +119,18 @@ else
   echo "FAIL SQLite dumps: live dumped=$([[ -s $DUMP_DIR/sqlite/app/live.db ]] && echo y || echo n), stale left=$([[ -e $DUMP_DIR/sqlite/gone/old.db ]] && echo y || echo n), ${#FAILURES[@]} failure(s)"
   rc=1
 fi
+
+state_case() {
+  local name=$1 want=$2 got=0
+  has_state "$CONFIG" && got=1
+  if (( got == want )); then echo "ok   $name"; else echo "FAIL $name: has_state=$got"; rc=1; fi
+}
+
+rm -rf "$work/disk"; mkdir -p "$CONFIG/caddy/webpages" "$CONFIG/sonarr" "$DUMP_DIR/sqlite"
+state_case "empty directories are not service state" 0
+: > "$CONFIG/caddy/Caddyfile"; : > "$DUMP_DIR/README"; : > "$DUMP_DIR/sqlite/x.db"
+state_case "Caddyfile and _dumps are not service state" 0
+: > "$CONFIG/sonarr/config.xml"
+state_case "one service file is service state" 1
 
 exit $rc

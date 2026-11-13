@@ -31,7 +31,7 @@ services:
     - no-new-privileges:true
     environment:
     - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-    - DOMAINS=${DOMAIN}, photos.${DOMAIN}, pass.${DOMAIN}, watch.${DOMAIN}, games.${DOMAIN}, status.${DOMAIN}, discover.${DOMAIN}, listen.${DOMAIN}, findmusic.${DOMAIN}, invite.${DOMAIN}, dav.${DOMAIN}, sync.${DOMAIN}, liva.${DOMAIN}, mc.${DOMAIN}
+    - DOMAINS=photos.${DOMAIN}, pass.${DOMAIN}, watch.${DOMAIN}, games.${DOMAIN}, status.${DOMAIN}, discover.${DOMAIN}, listen.${DOMAIN}, findmusic.${DOMAIN}, invite.${DOMAIN}, dav.${DOMAIN}, sync.${DOMAIN}, liva.${DOMAIN}, mc.${DOMAIN}
     - PROXIED=!is(mc.${DOMAIN})
     - IP4_PROVIDER=none
     - IP6_PROVIDER=cloudflare.trace

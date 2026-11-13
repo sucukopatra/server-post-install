@@ -146,9 +146,11 @@ if [[ ${DATA_IS_MOUNT:-1} == 1 ]] && ! mountpoint -q "$DATA"; then
 fi
 
 # Same reasoning, cruder: a wiped or not-yet-populated config tree.
-if [[ -z $(find "$CONFIG" -type f ! -path "$CONFIG/caddy/Caddyfile" ! -path "$CONFIG/_dumps/*" -print -quit) ]]; then
-  die "$CONFIG holds no service state -- restore first (bmo-restore --all); refusing to record an empty host"
-fi
+has_state() {
+  [[ -n $(find "$1" -type f ! -path "$1/caddy/Caddyfile" ! -path "$1/_dumps/*" -print -quit) ]]
+}
+has_state "$CONFIG" \
+  || die "$CONFIG holds no service state -- restore first (bmo-restore --all); refusing to record an empty host"
 
 # A killed run (reboot, OOM) leaves a lock behind. `unlock` without
 # --remove-all only clears locks whose process is gone, so it cannot
@@ -530,15 +532,14 @@ since_days=$(stamp_age_days "$CHECK_STAMP")
 
 if (( since_days >= CHECK_INTERVAL_DAYS )); then
   log "checking repository and a random 5% of its data"
-  if restic check --read-data-subset=5%; then
-    date +%s > "$CHECK_STAMP"
-  else
-    fail "restic check reported problems"
-  fi
+  checked=1
+  restic check --read-data-subset=5% \
+    || { fail "restic check reported problems"; checked=0; }
   if [[ -n ${OFFSITE_REPOSITORY:-} ]]; then
     restic -r "$OFFSITE_REPOSITORY" check --read-data-subset=5% \
-      || fail "restic check of $OFFSITE_REPOSITORY reported problems"
+      || { fail "restic check of $OFFSITE_REPOSITORY reported problems"; checked=0; }
   fi
+  if (( checked )); then date +%s > "$CHECK_STAMP"; fi
 else
   log "repository checked ${since_days}d ago, next in $(( CHECK_INTERVAL_DAYS - since_days ))d"
 fi

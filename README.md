@@ -34,6 +34,7 @@ Afterwards:
 
 ```sh
 sudo tailscale up                          # interactive, not automated
+sudo bmo-restore --all                     # rebuild only: before the stack starts, see Restore
 cd /srv/docker && docker compose up -d     # rebuilds caddy via xcaddy, minutes
 ```
 

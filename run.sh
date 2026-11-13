@@ -314,6 +314,18 @@ for grp in docker video render; do
   fi
 done
 
+DAEMON_JSON='{
+  "dns": ["1.1.1.1", "8.8.8.8"]
+}'
+if [[ $(sudo cat /etc/docker/daemon.json 2>/dev/null) != "$DAEMON_JSON" ]]; then
+  sudo install -d /etc/docker
+  printf '%s\n' "$DAEMON_JSON" | sudo tee /etc/docker/daemon.json >/dev/null
+  sudo systemctl restart docker
+  ok "containers resolve via 1.1.1.1 / 8.8.8.8 (/etc/docker/daemon.json)"
+else
+  skip "/etc/docker/daemon.json already sets container DNS"
+fi
+
 sudo systemctl enable --now docker >/dev/null
 ok "docker service enabled"
 
@@ -509,18 +521,13 @@ fi
 step "Secrets"
 
 if ! command -v sops >/dev/null; then
-  if [[ -n ${SOPS_VERSION:-} ]]; then
-    sops_ver="$SOPS_VERSION"
-    ok "using pinned sops $sops_ver"
-  else
-    latest_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-      https://github.com/getsops/sops/releases/latest) \
-      || die "could not reach GitHub to resolve the latest sops release"
-    sops_ver="${latest_url##*/tag/v}"
-    [[ $sops_ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-      || die "could not parse a version from: $latest_url"
-    ok "latest sops is $sops_ver"
-  fi
+  latest_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+    https://github.com/getsops/sops/releases/latest) \
+    || die "could not reach GitHub to resolve the latest sops release"
+  sops_ver="${latest_url##*/tag/v}"
+  [[ $sops_ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "could not parse a version from: $latest_url"
+  ok "latest sops is $sops_ver"
 
   # The plain binary, not the .deb: sops-v<ver>.checksums.txt covers only the
   # binaries, so a .deb cannot be verified against it at all.
@@ -878,7 +885,7 @@ if [[ -z $config_state ]]; then
   skip "docker-update.timer not enabled -- $CONFIG holds no service state, and its boot run would start the stack before a restore"
   skip "re-run run.sh --full once the stack has state to enable it"
 elif prompt_yn "enable docker-update.timer (pulls latest images after boot and every Sunday)?"; then
-  sudo systemctl enable docker-update.timer >/dev/null
+  sudo systemctl enable --now docker-update.timer >/dev/null
   ok "docker-update.timer enabled"
 else
   skip "docker-update.timer installed but not enabled"
