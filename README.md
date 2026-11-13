@@ -33,22 +33,32 @@ repository is reported, and `sudo rm /root/.restic-pass` lets you enter it again
 Afterwards:
 
 ```sh
-sudo tailscale up                          # interactive, not automated
+sudo tailscale up --advertise-exit-node --advertise-routes=<LAN_SUBNET>   # interactive
 sudo bmo-restore --all                     # rebuild only: before the stack starts, see Restore
 cd /srv/docker && docker compose up -d     # rebuilds caddy via xcaddy, minutes
 ```
 
+A new tailscale node gets a new IP. In the admin console, delete the old node,
+approve the new one's exit node and route, and either give it the old IP back
+or point the tailnet's split-DNS entry for `DOMAIN` at the new one.
+
 ## On a freshly installed Debian
 
-A minimal install cannot run this yet. As root:
+`run.sh` runs as your user through sudo, and `git` fetches it. As root:
 
 ```sh
-apt install sudo git curl && usermod -aG sudo <user>   # then log out and back in
+apt install sudo git && usermod -aG sudo <user>   # then log out and back in
 ```
 
-Then **mount `$DATA` and add it to `/etc/fstab` before running `run.sh`**.
-Unmounted, its directories land on the root disk and the eventual mount hides
-them. `run.sh` refuses to create them unless `DATA_IS_MOUNT=0` in `site.env`.
+With an empty root password the installer sets up sudo for you, and only
+`sudo apt install git` is left.
+
+With `DATA_UUID` set in `site.env` (`site.env.bmo` has it), `run.sh` adds
+`$DATA` to `/etc/fstab` and mounts it. Otherwise **mount `$DATA` and add it to
+`/etc/fstab` before running `run.sh`**. Unmounted, its directories land on the
+root disk and the eventual mount hides them. `run.sh` refuses to create them
+unless `DATA_IS_MOUNT=0` in `site.env`. The install's hostname picks the
+`site.env.<hostname>` profile, so name it `bmo`.
 
 ## Backups
 

@@ -272,6 +272,25 @@ else
   skip "Docker repository already present"
 fi
 
+if ! grep -rqsE '^[^#]*non-free([[:space:]]|$)' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+  sudo tee /etc/apt/sources.list.d/debian-non-free.sources >/dev/null <<EOF
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: ${APT_CODENAME} ${APT_CODENAME}-updates
+Components: non-free
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: ${APT_CODENAME}-security
+Components: non-free
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+  ok "Debian non-free component added ($APT_CODENAME)"
+else
+  skip "Debian non-free component already enabled"
+fi
+
 if ! grep -rqs pkgs.tailscale.com /etc/apt/sources.list.d/; then
   curl -fsSL "https://pkgs.tailscale.com/stable/${APT_DISTRO}/${APT_CODENAME}.noarmor.gpg" \
     | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
@@ -440,6 +459,17 @@ create_dirs() {
 }
 
 create_dirs local
+
+if [[ -n ${DATA_UUID:-} ]] && ! findmnt -sn -M "$DATA" >/dev/null; then
+  data_fs=$(lsblk -no FSTYPE "/dev/disk/by-uuid/$DATA_UUID" 2>/dev/null || true)
+  [[ -n $data_fs ]] || die "no filesystem with UUID $DATA_UUID (DATA_UUID in site.env) -- is the data disk attached?"
+  sudo cp /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+  echo "UUID=$DATA_UUID $DATA $data_fs defaults,noatime 0 2" | sudo tee -a /etc/fstab >/dev/null
+  sudo systemctl daemon-reload
+  sudo mkdir -p "$DATA"
+  sudo mount "$DATA"
+  ok "$DATA added to fstab and mounted ($data_fs, UUID $DATA_UUID)"
+fi
 
 # DATA_IS_MOUNT declares whether $DATA is a separate disk, rather than being
 # probed from fstab: on a freshly reinstalled host fstab has not been written
@@ -956,6 +986,16 @@ fi
 sudo ufw --force enable >/dev/null
 ok "ufw enabled"
 
+TS_SYSCTL='net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1'
+if [[ $(cat /etc/sysctl.d/99-tailscale.conf 2>/dev/null) != "$TS_SYSCTL" ]]; then
+  printf '%s\n' "$TS_SYSCTL" | sudo tee /etc/sysctl.d/99-tailscale.conf >/dev/null
+  sudo sysctl -q -p /etc/sysctl.d/99-tailscale.conf
+  ok "IP forwarding on for the tailscale exit node and LAN route"
+else
+  skip "IP forwarding already on (/etc/sysctl.d/99-tailscale.conf)"
+fi
+
 # The restic repository lives on the NAS and survives a reformat of this
 # host. This step reconnects to it -- it never runs `restic init`, which
 # would orphan every existing snapshot.
@@ -1133,7 +1173,7 @@ ${c_grn}Provisioning complete.${c_off}
 
 Not done by this script, on purpose:
   - restic init  (a new repo must be created by hand -- see above)
-  - tailscale up  (needs interactive auth)
+  - sudo tailscale up --advertise-exit-node --advertise-routes=$LAN_SUBNET  (interactive auth)
 EOF
 
 if [[ -z $config_state ]] && (( ${snap_count:-0} > 0 )); then

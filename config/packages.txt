@@ -11,9 +11,10 @@ nano
 tmux
 tree
 unzip
+wget
 zip
-# `unrar` proper is in non-free, which a default Debian install does not
-# enable; unrar-free is in main and is what unpackerr needs.
+# `unrar` is in non-free, which run.sh enables.
+unrar
 unrar-free
 bash-completion
 ncdu
@@ -32,5 +33,7 @@ speedtest-cli
 tailscale
 
 # --- misc ---
+smartmontools
+ffmpeg
 cockpit
 cockpit-files
